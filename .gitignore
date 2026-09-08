@@ -1,0 +1,22 @@
+build/
+dist/
+artifacts/
+**/bin/
+**/obj/
+.vs/
+*.user
+*.pdb
+*.log
+*.zip
+*.exe
+*.dll
+__pycache__/
+*.py[cod]
+!third_party/**/LICENSE*
+# Keep the full development dependency copy locally; publish only KPatchCore.
+/third_party/KotorPatchManager/*
+!/third_party/KotorPatchManager/LICENSE
+!/third_party/KotorPatchManager/src/
+!/third_party/KotorPatchManager/AddressDatabases/
+/third_party/KotorPatchManager/src/*
+!/third_party/KotorPatchManager/src/KPatchCore/

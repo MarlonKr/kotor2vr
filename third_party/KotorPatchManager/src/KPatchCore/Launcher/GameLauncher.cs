@@ -1,0 +1,354 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using KPatchCore.Detectors;
+using KPatchCore.Models;
+
+namespace KPatchCore.Launcher;
+
+/// <summary>
+/// Provides game launching functionality with automatic patch detection and patcher loading
+/// </summary>
+public static class GameLauncher
+{
+    /// <summary>
+    /// Launches a game executable with automatic patch detection
+    /// Detects if patches are installed and loads KotorPatcher.dll if needed
+    /// Falls back to vanilla launch if no patches detected
+    /// </summary>
+    /// <param name="gameExePath">Path to game executable</param>
+    /// <param name="commandLineArgs">Optional command line arguments</param>
+    /// <returns>Launch result with process information</returns>
+    public static LaunchResult LaunchGame(string gameExePath, string? commandLineArgs = null, LaunchConfig? launchConfig = null)
+    {
+        // Validate game path
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        var gameDir = Path.GetDirectoryName(gameExePath);
+        if (string.IsNullOrWhiteSpace(gameDir))
+        {
+            return LaunchResult.Fail($"Could not determine game directory from path: {gameExePath}");
+        }
+
+        var patchConfigPath = Path.Combine(gameDir, "patch_config.toml");
+
+        // Detect the game before deciding anything. The deployment method decides both the
+        // patcher module the game loads and how the game is started, and only the first of
+        // those depends on patches being installed.
+        var versionResult = GameDetector.DetectVersion(gameExePath, allowManagedInstallState: true);
+        var gameVersion = versionResult.Data;
+        var distribution = gameVersion?.Distribution ?? Distribution.Other;
+        var deployment = gameVersion != null
+            ? DeploymentPolicy.ForGame(gameVersion)
+            : DeploymentPolicy.ForCurrentPlatform();
+
+        if (!File.Exists(patchConfigPath))
+        {
+            return LaunchVanilla(gameExePath, commandLineArgs, launchConfig, deployment);
+        }
+
+        var moduleName = DeploymentPolicy.PatcherModuleFileName(deployment);
+        var patcherModulePath = Path.Combine(gameDir, moduleName);
+        if (!File.Exists(patcherModulePath))
+        {
+            return LaunchResult.Fail(
+                $"Patches are installed (patch_config.toml found) but {moduleName} is missing. " +
+                $"Expected location: {patcherModulePath}");
+        }
+
+        return Launch(gameExePath, patcherModulePath, distribution, commandLineArgs, launchConfig, deployment);
+    }
+
+    /// <summary>
+    /// Launches a patched game with an explicit patcher DLL
+    /// </summary>
+    /// <param name="gameExePath">Path to game executable</param>
+    /// <param name="dllPath">Path to the patcher DLL to load</param>
+    /// <param name="distribution">Game distribution (for the launch strategy)</param>
+    /// <param name="commandLineArgs">Optional command line arguments</param>
+    /// <returns>Launch result with process information</returns>
+    public static LaunchResult Launch(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        string? commandLineArgs = null,
+        LaunchConfig? launchConfig = null,
+        DeploymentMethod? deployment = null)
+    {
+        // Validate inputs
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        // Delegate to the platform-specific launcher
+        return CreateLauncher(launchConfig, deployment).Launch(gameExePath, dllPath, commandLineArgs, distribution);
+    }
+
+    /// <summary>
+    /// KOTOR2VR-specific injection entry point. In addition to LoadLibrary success,
+    /// this requires the injected module's explicit K2VR probe bootstrap export and
+    /// its fresh persistent target-process witness. Ordinary KPatchManager callers
+    /// intentionally use <see cref="Launch"/> and retain the original DLL contract.
+    /// </summary>
+    public static LaunchResult LaunchWithRequiredKotor2VrProbeBootstrap(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        string? commandLineArgs = null)
+    {
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return LaunchResult.Fail(
+                "The explicit KOTOR2VR probe bootstrap requires Windows injection.");
+        }
+
+        return ProcessInjector.LaunchWithInjection(
+            gameExePath,
+            dllPath,
+            commandLineArgs,
+            distribution,
+            requiredKotor2VrBootstrap: Kotor2VrBootstrapKind.Probe);
+    }
+
+    /// <summary>
+    /// KOTOR2VR diagnostic entry point that requires the dedicated bounded render
+    /// trace bootstrap. This never changes the ordinary KPatchManager DLL contract.
+    /// </summary>
+    public static LaunchResult LaunchWithRequiredKotor2VrRenderTraceBootstrap(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        string? commandLineArgs = null)
+    {
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return LaunchResult.Fail(
+                "The explicit KOTOR2VR render trace bootstrap requires Windows injection.");
+        }
+
+        return ProcessInjector.LaunchWithInjection(
+            gameExePath,
+            dllPath,
+            commandLineArgs,
+            distribution,
+            requiredKotor2VrBootstrap: Kotor2VrBootstrapKind.RenderTrace);
+    }
+
+    /// <summary>
+    /// KOTOR2VR diagnostic entry point that explicitly arms one F8-triggered
+    /// extra call of the original Scene+0xB8 render method. It is deliberately
+    /// separate from the passive render trace contract.
+    /// </summary>
+    public static LaunchResult LaunchWithRequiredKotor2VrRenderDoublePassBootstrap(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        string? commandLineArgs = null)
+    {
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return LaunchResult.Fail(
+                "The explicit KOTOR2VR render double-pass bootstrap requires Windows injection.");
+        }
+
+        return ProcessInjector.LaunchWithInjection(
+            gameExePath,
+            dllPath,
+            commandLineArgs,
+            distribution,
+            requiredKotor2VrBootstrap: Kotor2VrBootstrapKind.RenderDoublePass);
+    }
+
+    /// <summary>
+    /// KOTOR2VR bridge smoke entry point. The packed v1 payload is copied to the
+    /// target and passed only to K2VR_VrBridgeBootstrap; historical bootstraps keep
+    /// their null thread argument.
+    /// </summary>
+    public static LaunchResult LaunchWithRequiredKotor2VrVrBridgeBootstrap(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        byte[] bootstrapPayload,
+        string? commandLineArgs = null)
+    {
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return LaunchResult.Fail(
+                "The explicit KOTOR2VR VrBridge bootstrap requires Windows injection.");
+        }
+
+        return ProcessInjector.LaunchWithInjection(
+            gameExePath,
+            dllPath,
+            commandLineArgs,
+            distribution,
+            requiredKotor2VrBootstrap: Kotor2VrBootstrapKind.VrBridge,
+            requiredKotor2VrBootstrapArgument: bootstrapPayload);
+    }
+
+    /// <summary>
+    /// KOTOR2VR visible game-image diagnostic. The packed v1 session payload is
+    /// copied into the target and passed to K2VR_GameImageSmokeBootstrap.
+    /// </summary>
+    public static LaunchResult LaunchWithRequiredKotor2VrGameImageSmokeBootstrap(
+        string gameExePath,
+        string dllPath,
+        Distribution distribution,
+        byte[] bootstrapPayload,
+        string? commandLineArgs = null)
+    {
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
+        {
+            return LaunchResult.Fail($"DLL not found: {dllPath}");
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return LaunchResult.Fail(
+                "The explicit KOTOR2VR game-image smoke bootstrap requires Windows injection.");
+        }
+
+        return ProcessInjector.LaunchWithInjection(
+            gameExePath,
+            dllPath,
+            commandLineArgs,
+            distribution,
+            requiredKotor2VrBootstrap: Kotor2VrBootstrapKind.GameImageSmoke,
+            requiredKotor2VrBootstrapArgument: bootstrapPayload);
+    }
+
+    /// <summary>
+    /// Selects the launch strategy for the configured deployment method.
+    /// </summary>
+    private static IGameLauncher CreateLauncher(LaunchConfig? launchConfig, DeploymentMethod? deployment)
+    {
+        // Callers that never detected the game fall back to the host's default.
+        var method = deployment ?? DeploymentPolicy.ForCurrentPlatform();
+
+        // Anything the manager cannot start itself is started the way the user configured:
+        // the game loads the patcher on its own, via the staged proxy or via DT_NEEDED.
+        if (!DeploymentPolicy.HostStartsGameDirectly(method))
+        {
+            return new ConfiguredGameLauncher(launchConfig ?? new LaunchConfig());
+        }
+
+        // Injection only works on Windows (it uses the Win32 API).
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return new WindowsGameInjector();
+        }
+
+        return new UnsupportedGameInjector();
+    }
+
+    /// <summary>
+    /// Launches a game without any modification (vanilla launch)
+    /// </summary>
+    /// <param name="gameExePath">Path to game executable</param>
+    /// <param name="commandLineArgs">Optional command line arguments</param>
+    /// <param name="launchConfig">How to start the game, when the host cannot run it directly</param>
+    /// <param name="deployment">The game's deployment method; defaults to the host's</param>
+    /// <returns>Launch result with process information</returns>
+    public static LaunchResult LaunchVanilla(
+        string gameExePath,
+        string? commandLineArgs = null,
+        LaunchConfig? launchConfig = null,
+        DeploymentMethod? deployment = null)
+    {
+        // Validate game path
+        if (string.IsNullOrWhiteSpace(gameExePath) || !File.Exists(gameExePath))
+        {
+            return LaunchResult.Fail($"Game executable not found: {gameExePath}");
+        }
+
+        // Whether the game is patched changes what gets loaded into it, not how it is
+        // started, so an unpatched launch asks the same question a patched one does.
+        if (!DeploymentPolicy.HostStartsGameDirectly(deployment ?? DeploymentPolicy.ForCurrentPlatform()))
+        {
+            return LaunchDispatcher.Start(
+                launchConfig ?? new LaunchConfig(), gameExePath, "No patches are installed.");
+        }
+
+        try
+        {
+            var gameDir = Path.GetDirectoryName(gameExePath);
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = gameExePath,
+                Arguments = commandLineArgs ?? string.Empty,
+                UseShellExecute = true,
+                WorkingDirectory = gameDir
+            };
+
+            var process = Process.Start(startInfo);
+
+            if (process == null)
+            {
+                return LaunchResult.Fail("Process.Start returned null - game may have failed to launch");
+            }
+
+            return LaunchResult.Ok(
+                process,
+                injectionPerformed: false,
+                $"Launched {Path.GetFileName(gameExePath)} in vanilla mode (no patches)");
+        }
+        catch (Exception ex)
+        {
+            return LaunchResult.Fail($"Vanilla launch failed: {ex.Message}");
+        }
+    }
+}

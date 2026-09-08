@@ -1,0 +1,32 @@
+[
+  {
+    "Package": "LibObjectFile-2.2.0",
+    "URL": "https://raw.githubusercontent.com/xoofx/LibObjectFile/e864861b132279b1c0d0103f7956104f40358c00/license.txt",
+    "SHA256": "d8e07b545a6d252502272c8070a673b1401c84acb7b1dd72c04c4c2bffad7579"
+  },
+  {
+    "Package": "Tomlyn-0.19.0",
+    "URL": "https://raw.githubusercontent.com/xoofx/Tomlyn/ee3e3ca5b1f016b0db21ceb74d6c85d28a08ca16/license.txt",
+    "SHA256": "d5044cd5e1438c78e9ba08ddc78d2d15d97e27456c0ed1aa653713705e302897"
+  },
+  {
+    "Package": "MinVer-7.0.0",
+    "URL": "https://raw.githubusercontent.com/adamralph/minver/288e752d82a772660e740178ba11c8adba5e217a/LICENSE",
+    "SHA256": "e03ba41d7fab20700769fe4118bab50d800cb74f990353a05d2f5fff1c228363"
+  },
+  {
+    "Package": "Microsoft.Data.Sqlite-8.0.0",
+    "URL": "https://raw.githubusercontent.com/dotnet/efcore/e017dc125bef2f604f85befd8ff27544a5a67c38/LICENSE.txt",
+    "SHA256": "ae48df11a335dc1a615f4f938b69cba73bcf4485c4f97af49b38efb0f216353b"
+  },
+  {
+    "Package": "SQLitePCLRaw-2.1.6",
+    "URL": "https://raw.githubusercontent.com/ericsink/SQLitePCL.raw/9c66b4f618d9d6831e83c16a8036daea83df4ddb/LICENSE.TXT",
+    "SHA256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "Package": "SQLitePCLRaw-2.1.6",
+    "URL": "https://raw.githubusercontent.com/ericsink/SQLitePCL.raw/9c66b4f618d9d6831e83c16a8036daea83df4ddb/NOTICE.TXT",
+    "SHA256": "485b276b3d2bfaa26df348e1e5c84df3648981e09b88531a6a53006f0705c24b"
+  }
+]

@@ -1,0 +1,13 @@
+# Portable native stereo V1. Paths are relative to this file.
+# Start-VR selects the game automatically or shows a file browser.
+[game]
+executable = "../swkotor2.exe"
+expected_sha256 = "6A522E71631DCEE93467BD2010F3B23D9145326E1E2E89305F13AB104DBBFFEF"
+steam_app_id = 208580
+
+[paths]
+host_executable = "kotor2vr-host64.exe"
+game_module = "kotor2vr-game32.dll"
+
+[dlss5]
+enabled = false

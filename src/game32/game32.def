@@ -1,0 +1,11 @@
+LIBRARY "kotor2vr-game32"
+
+EXPORTS
+    ; Stable undecorated name for the x86 __stdcall remote-thread entry point.
+    K2VR_ProbeBootstrap=_K2VR_ProbeBootstrap@4
+    K2VR_RenderTraceBootstrap=_K2VR_RenderTraceBootstrap@4
+    K2VR_RenderDoublePassBootstrap=_K2VR_RenderDoublePassBootstrap@4
+    K2VR_GameImageSmokeBootstrap=_K2VR_GameImageSmokeBootstrap@4
+    K2VR_RenderTraceStop=_K2VR_RenderTraceStop@4
+    K2VR_VrBridgeBootstrap=_K2VR_VrBridgeBootstrap@4
+    K2VR_VrBridgeStop=_K2VR_VrBridgeStop@4
