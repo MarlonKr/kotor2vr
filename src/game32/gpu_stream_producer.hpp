@@ -149,6 +149,7 @@ struct GpuStreamFrameDecision {
 void ProduceGpuStreamAfterScenePass(std::uint64_t scene_frame_id) noexcept;
 void NotifyGpuStreamContextDeleted(void* context) noexcept;
 void RecoverGpuStreamContext() noexcept;
+[[nodiscard]] bool GpuStreamContextRecoveryPending() noexcept;
 [[nodiscard]] GpuStreamProducerStatus ShutdownGpuStreamProducer() noexcept;
 [[nodiscard]] bool IsGpuStreamProducerRunning() noexcept;
 

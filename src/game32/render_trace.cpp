@@ -159,7 +159,6 @@ thread_local void* g_hmd_baseline_camera = nullptr;
 thread_local ipc::PoseF32 g_hmd_baseline{};
 thread_local std::uint64_t g_native_camera_frame = 0;
 float g_engine_units_per_metre=1.0F;
-float g_first_person_height_m=1.65F;
 float g_first_person_forward_m=0.10F;
 bool g_first_person_enabled=true;
 bool g_recenter_yaw_only=true;
@@ -197,10 +196,6 @@ void LoadCameraSettings() noexcept {
     g_stereo_request_gate=GetPrivateProfileIntW(L"camera",L"stereo_request_gate",0,path)!=0;
     g_stereo_request_cadence=GetPrivateProfileIntW(L"camera",L"stereo_request_cadence",0,path)!=0;
     gpu_timing::Configure(GetPrivateProfileIntW(L"camera",L"gl_gpu_timing",0,path)!=0);
-    GetPrivateProfileStringW(L"camera",L"first_person_height_m",L"1.65",value,64,path);
-    const double height=std::wcstod(value,&end);
-    if (end!=value && *end==L'\0' && std::isfinite(height) && height>=0.2 && height<=3.0)
-        g_first_person_height_m=static_cast<float>(height);
     GetPrivateProfileStringW(L"camera",L"first_person_forward_m",L"0.10",value,64,path);
     const double forward=std::wcstod(value,&end);
     if (end!=value && *end==L'\0' && std::isfinite(forward) && forward>=0.0 && forward<=0.5)
@@ -715,7 +710,21 @@ struct ExtraPassOutcome {
     return outcome;
 }
 
-[[nodiscard]] bool ReadFirstPersonTargetSeh(void* self, math::Vec3& target) noexcept {
+enum class FirstPersonRead : unsigned { Disabled, NonGameplay, MissingTarget, UnsupportedAbi,
+    InvalidFeet, MissingOrInvalidHook, ReadFault, Ready, InvalidAnchor };
+struct FirstPersonSample {
+    std::uintptr_t target{};
+    math::Vec3 feet{};
+    FirstPersonEye eye{};
+    EgoMeshSelection visibility{};
+    FirstPersonRead status{FirstPersonRead::NonGameplay};
+};
+thread_local std::uintptr_t g_last_first_person_target=UINTPTR_MAX;
+thread_local FirstPersonHook g_last_first_person_hook=FirstPersonHook::None;
+thread_local FirstPersonRead g_last_first_person_status=FirstPersonRead::Disabled;
+
+[[nodiscard]] FirstPersonSample ReadFirstPersonTargetSeh(void* self) noexcept {
+    FirstPersonSample sample{};
     __try {
         const auto base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
         const auto* behavior=*reinterpret_cast<unsigned char* const*>(static_cast<unsigned char*>(self)+0x1B8);
@@ -727,25 +736,53 @@ struct ExtraPassOutcome {
                 table==base+0x009A1F70U-0x00400000U ? 1U:0U);
             (void)AppendPersistentProbeLogLine(line); g_last_behavior_table=table;
         }
-        // Exact RTTI: CSWCameraOnAStick. Dialog, death, free-look and unknown
-        // camera behaviors keep their authored camera. +1C is its CAurCamera
-        // interface owner (Camera+4), confirmed from the first live run.
-        if (!behavior || *reinterpret_cast<const std::uintptr_t*>(behavior)!=base+0x009A1F70U-0x00400000U ||
-            *reinterpret_cast<void* const*>(behavior+0x1C)!=static_cast<unsigned char*>(self)+4) return false;
+        // Exact CSWCameraOnAStick and its CAurCamera owner. Authored cameras
+        // remain authoritative during dialog, death, free-look and unknown modes.
+        if (!behavior || table!=base+0x009A1F70U-0x00400000U ||
+            *reinterpret_cast<void* const*>(behavior+0x1C)!=static_cast<unsigned char*>(self)+4) return sample;
         auto* object=*reinterpret_cast<void* const*>(behavior+0x14);
-        if (!object) return false;
-        const auto address=(*reinterpret_cast<std::uintptr_t**>(object))[0x64/4];
-        // This is the same GetPosition(sret) call used at 0x7DE436..0x7DE44E.
-        if (address<base+0x1000U || address>=base+0x00586000U) return false;
+        sample.target=reinterpret_cast<std::uintptr_t>(object);
+        sample.status=FirstPersonRead::MissingTarget;
+        if (!object) return sample;
+        const auto* vtable=*reinterpret_cast<const std::uintptr_t* const*>(object);
+        const auto position_address=vtable[0x64/4], hook_address=vtable[0x98/4];
+        sample.status=FirstPersonRead::UnsupportedAbi;
+        // Exact Gob implementations, confirmed against the supported executable.
+        const unsigned char position_prefix[]={0x55,0x8b,0xec,0x51,0x89,0x4d,0xfc};
+        const unsigned char hook_prefix[]={0x55,0x8b,0xec,0x83,0xec,0x24,0x89,0x4d,0xdc};
+        if (position_address!=base+0x00059710U || hook_address!=base+0x00062B90U ||
+            std::memcmp(reinterpret_cast<const void*>(position_address),position_prefix,sizeof(position_prefix))!=0 ||
+            std::memcmp(reinterpret_cast<const void*>(hook_address),hook_prefix,sizeof(hook_prefix))!=0) return sample;
         using GetPosition=math::Vec3*(__thiscall*)(void*,math::Vec3*);
-        const auto* result=reinterpret_cast<GetPosition>(address)(object,&target);
-        return result==&target && math::IsFinite(target);
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+        using GetHook=int(__thiscall*)(void*,const char*,math::Vec3*,void*);
+        sample.status=FirstPersonRead::InvalidFeet;
+        if (reinterpret_cast<GetPosition>(position_address)(object,&sample.feet)!=&sample.feet ||
+            !math::IsFinite(sample.feet)) return sample;
+        const float nan=std::numeric_limits<float>::quiet_NaN();
+        math::Vec3 free_look{nan,nan,nan}, camera{nan,nan,nan};
+        const auto get_hook=reinterpret_cast<GetHook>(hook_address);
+        // Same ordered lookup as CSWCameraFreeLook::Control, 0x7E2B16..0x7E2BC2.
+        // GetHook allows a null quaternion output; its position is already world-space.
+        const bool free_found=get_hook(object,"FreeLookHook",&free_look,nullptr)!=0;
+        sample.eye=SelectFirstPersonEye(sample.feet,free_found,free_look,false,camera);
+        if (sample.eye.hook==FirstPersonHook::None) {
+            const bool camera_found=get_hook(object,"CameraHook",&camera,nullptr)!=0;
+            sample.eye=SelectFirstPersonEye(sample.feet,free_found,free_look,camera_found,camera);
+        }
+        sample.status=sample.eye.hook==FirstPersonHook::None ?
+            FirstPersonRead::MissingOrInvalidHook:FirstPersonRead::Ready;
+        sample.visibility.feet=sample.feet;
+        sample.visibility.short_model=sample.status==FirstPersonRead::Ready &&
+            ShortEgoModel(sample.feet,sample.eye.world);
+        return sample;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        sample.eye={}; sample.status=FirstPersonRead::ReadFault; return sample;
+    }
 }
 
 [[nodiscard]] bool InvokeStereoCameraSeh(void* self,
     const EngineCameraPoseWxyz& authored, const EngineCameraPoseWxyz& vr_anchor,
-    const ipc::RenderRequest& request,math::Vec3 ego_target) noexcept {
+    const ipc::RenderRequest& request,const FirstPersonSample& sample) noexcept {
     EngineCameraPoseWxyz eyes[2]{};
     for (std::size_t i=0;i<2;++i) {
         const auto composed=ComposeStereoEyePose(vr_anchor,g_hmd_baseline,request,i,g_engine_units_per_metre);
@@ -753,7 +790,8 @@ struct ExtraPassOutcome {
         eyes[i]=composed.pose;
     }
     unsigned char original_projection[36]{}; // +204..+227; includes viewport and clips
-    ConfigureNativeStereoEgoVisibility(ego_target,eyes[0],g_engine_units_per_metre,
+    ConfigureNativeStereoEgoVisibility(reinterpret_cast<const void*>(sample.target),sample.visibility,
+        eyes[0],g_engine_units_per_metre,
         g_hide_near_self_mesh && request.presentation_state==ipc::PresentationState::WorldFirstPerson);
     const auto base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     auto* framebuffer_effects=reinterpret_cast<std::int32_t*>(base+0x009F4E74U-0x00400000U);
@@ -867,21 +905,40 @@ std::uint64_t __fastcall CameraRenderSceneWrapper(void* self,
         if (toggle && !g_camera_toggle_was_down) g_first_person_enabled=!g_first_person_enabled;
         g_camera_toggle_was_down=toggle;
         EngineCameraPoseWxyz vr_anchor=authored;
-        math::Vec3 target{};
+        FirstPersonSample sample{};
+        sample.status=FirstPersonRead::Disabled;
         bool first_person=false;
-        if (g_first_person_enabled && ReadFirstPersonTargetSeh(self,target)) {
-            const auto anchor=ComposeFirstPersonAnchor(authored,target,g_engine_units_per_metre,
-                g_first_person_height_m,g_first_person_forward_m);
-            if (anchor.valid) { vr_anchor=anchor.pose; first_person=true; }
+        if (g_first_person_enabled) {
+            sample=ReadFirstPersonTargetSeh(self);
+            if (sample.status==FirstPersonRead::Ready) {
+                const auto anchor=ComposeFirstPersonAnchor(authored,sample.eye.world,
+                    g_engine_units_per_metre,g_first_person_forward_m);
+                if (anchor.valid) { vr_anchor=anchor.pose; first_person=true; }
+                else sample.status=FirstPersonRead::InvalidAnchor;
+            }
         }
-        if (first_person!=g_first_person_applied) {
+        if (first_person!=g_first_person_applied || sample.target!=g_last_first_person_target ||
+            sample.eye.hook!=g_last_first_person_hook) {
             request.history_reset_reasons |= static_cast<std::uint32_t>(ipc::ResetReason::CameraModeChange);
-            (void)AppendPersistentProbeLogLine(first_person ? "camera-mode first-person target=on-a-stick" :
-                "camera-mode authored-camera");
-            g_first_person_applied=first_person;
         }
+        if (first_person!=g_first_person_applied || sample.target!=g_last_first_person_target ||
+            sample.eye.hook!=g_last_first_person_hook || sample.status!=g_last_first_person_status) {
+            const char* reasons[]={"disabled","non-gameplay","missing-target","unsupported-abi",
+                "invalid-feet","missing-or-invalid-hook","read-fault","ready","invalid-anchor"};
+            const char* hooks[]={"none","FreeLookHook","CameraHook"};
+            char line[256]{};
+            std::snprintf(line,sizeof(line),"camera-mode %s target=0x%08llX hook=%s reason=%s height_engine=%.3f",
+                first_person ? "first-person":"authored-camera",
+                static_cast<unsigned long long>(sample.target),hooks[static_cast<unsigned>(sample.eye.hook)],
+                reasons[static_cast<unsigned>(sample.status)],first_person ? sample.eye.world.z-sample.feet.z:0.0F);
+            (void)AppendPersistentProbeLogLine(line);
+        }
+        g_first_person_applied=first_person;
+        g_last_first_person_target=sample.target;
+        g_last_first_person_hook=sample.eye.hook;
+        g_last_first_person_status=sample.status;
         if (first_person) request.presentation_state=ipc::PresentationState::WorldFirstPerson;
-        const bool stereo_ready=InvokeStereoCameraSeh(self,authored,vr_anchor,request,target);
+        const bool stereo_ready=InvokeStereoCameraSeh(self,authored,vr_anchor,request,sample);
         ScopedGameImageCapturePolicy monitor(GameImageCapturePolicy::Suppressed);
         const auto result=InvokeMonitorReplaySeh(self,stereo_ready && NativeStereoMonitorMirrorEnabled());
         BeginNativeStereoHud();

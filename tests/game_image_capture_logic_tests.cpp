@@ -1,4 +1,5 @@
 #include "game_image_capture.hpp"
+#include "gl_context_recovery.hpp"
 
 #include <cstddef>
 #include <cstdlib>
@@ -18,6 +19,41 @@ void Check(bool condition) {
 
 int main() {
     using namespace k2vr::game32;
+
+    // Graphics reset: context and DC numeric handles may be reused or changed,
+    // and the window creator need not be the GL owner. Recovery is selected by
+    // the actual target window, with thread ownership left to each producer.
+    Check(IsGameContextRecoverySurface(0x20000,10,10,true,42,42));
+    Check(IsGameContextRecoverySurface(0x30000,10,10,true,42,42));
+    Check(IsGameContextRecoverySurface(0x30000,20,20,true,42,42));
+    // A wrong-window present must defer recovery; the next verified world
+    // camera call on the replacement window remains eligible.
+    Check(!IsGameContextRecoverySurface(0x30000,20,10,true,42,42));
+    Check(IsGameContextRecoverySurface(0x30000,20,20,true,42,42));
+    Check(!IsGameContextRecoverySurface(0,20,20,true,42,42));
+    Check(!IsGameContextRecoverySurface(0x30000,0,0,true,42,42));
+    Check(!IsGameContextRecoverySurface(0x30000,20,20,false,42,42));
+    Check(!IsGameContextRecoverySurface(0x30000,20,20,true,99,42));
+    Check(!IsGameContextRecoverySurface(0x30000,20,20,true,0,0));
+
+    GlContextRecoveryRetry recovery;
+    Check(recovery.BeginAttempt(100,false));
+    // A failed import remains retryable without busy-looping every frame.
+    Check(!recovery.imported());
+    Check(!recovery.BeginAttempt(1099,false));
+    Check(recovery.BeginAttempt(1100,false));
+    recovery.MarkImported();
+    // Shader/FBO failure keeps the imports for the next attempt, and a
+    // temporary context cannot consume or reset that successful import.
+    Check(!recovery.BeginAttempt(2100,false));
+    Check(recovery.imported());
+    Check(recovery.BeginAttempt(2100,true));
+    Check(recovery.imported());
+    // Another confirmed deletion abandons imports and restarts immediately,
+    // including when Windows recycles the same HGLRC numeric value.
+    recovery.Reset();
+    Check(!recovery.imported());
+    Check(recovery.BeginAttempt(2101,false));
 
     static_assert(sizeof(GameImageSmokeBootstrapV1) == 32);
     static_assert(sizeof(GameImageSharedHeaderV1) == 64);

@@ -1,4 +1,5 @@
 #include "kotorvr/host/d3d12_bgra_upload.hpp"
+#include "kotorvr/host/ui_pose.hpp"
 #include "kotorvr/host/game_image_snapshot.hpp"
 #include "kotorvr/host/visible_smoke.hpp"
 
@@ -44,6 +45,44 @@ kotorvr::host::GameImageSnapshotHeader ValidHeader() {
 
 int main() {
     using namespace kotorvr::host;
+
+    {
+        using namespace k2vr::math;
+        const Vec3 head_position{1.2F,1.7F,-0.4F};
+        for (const float yaw: {-2.9F,-0.7F,0.F,1.4F,3.F}) {
+            for (const float pitch: {-1.4F,-0.5F,0.F,0.8F,1.4F}) {
+                const auto gaze=Multiply(FromAxisAngle({0,1,0},yaw),FromAxisAngle({1,0,0},pitch));
+                for (const float roll: {-1.F,0.6F,1.8F}) {
+                    const k2vr::math::Pose raw{head_position,Multiply(gaze,FromAxisAngle({0,0,1},roll))};
+                    const auto upright=MakeUprightUiHead(raw);
+                    const auto right=Rotate(upright.pose.orientation,{1,0,0});
+                    const auto forward=Rotate(upright.pose.orientation,{0,0,-1});
+                    const auto expected=Rotate(raw.orientation,{0,0,-1});
+                    const auto panel=PlaceUiPanel(upright.pose,1.5F);
+                    Check(upright.valid && std::abs(right.y)<0.00001F &&
+                        Length(forward-expected)<0.00001F &&
+                        Length(panel.position-(head_position+expected*1.5F))<0.00001F,
+                        "UI follows yaw/pitch and head position, independent of head roll");
+                }
+            }
+        }
+        const k2vr::math::Pose raw{{0,1.7F,0},Multiply(FromAxisAngle({0,1,0},0.7F),
+            FromAxisAngle({1,0,0},kPi*0.5F))};
+        const auto vertical=MakeUprightUiHead(raw,0.7F);
+        Check(vertical.valid && vertical.yaw==0.7F && IsFinite(vertical.pose) &&
+            std::abs(Rotate(vertical.pose.orientation,{1,0,0}).y)<0.00001F,
+            "vertical gaze retains prior yaw without introducing roll");
+        const auto tilted=MakeUprightUiHead({{0,1,0},Multiply(FromAxisAngle({1,0,0},0.4F),
+            FromAxisAngle({0,0,1},0.8F))});
+        const auto normal=PlaceUiPanel(tilted.pose,1.5F);
+        const auto dialogue=PlaceUiPanel(tilted.pose,1.5F,0.1232F);
+        Check(Length((dialogue.position-normal.position)-
+            Rotate(tilted.pose.orientation,{0,0.1232F,0}))<0.00001F,
+            "dialogue offset follows the level panel up axis");
+        Check(!MakeUprightUiHead({{}, {0,0,0,0}}).valid &&
+            !MakeUprightUiHead({{0,std::numeric_limits<float>::quiet_NaN(),0},{}}).valid,
+            "invalid head poses cannot produce UI anchors");
+    }
 
     constexpr k2vr::ipc::SessionNonce nonce{0x1122334455667788ULL,
                                              0x8877665544332211ULL};
@@ -162,6 +201,16 @@ int main() {
               !ResampleBgra8(frame, {4, 4}, scaled, 16,
                              BgraUploadTarget::Unsupported),
           "short destination stride and unsupported target fail closed");
+
+    std::array<std::uint8_t,32> letterboxed{};
+    Check(ResampleBgra8(frame,{4,2},letterboxed,16,BgraUploadTarget::Bgra8,true) &&
+        letterboxed[0]==0 && letterboxed[3]==255 && letterboxed[4]==frame.pixels[0] &&
+        letterboxed[8]==frame.pixels[4] && letterboxed[12]==0 && letterboxed[15]==255,
+        "square movie is pillarboxed instead of stretched into a wide theater");
+    Check(ResampleBgra8(frame,{2,4},letterboxed,8,BgraUploadTarget::Bgra8,true) &&
+        letterboxed[0]==0 && letterboxed[3]==255 && letterboxed[8]==frame.pixels[0] &&
+        letterboxed[16]==frame.pixels[8] && letterboxed[24]==0 && letterboxed[31]==255,
+        "square movie is letterboxed in a tall target with opaque bars");
 
     if (failures == 0) {
         std::cout << "All game-image smoke tests passed.\n";

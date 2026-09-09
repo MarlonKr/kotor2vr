@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(kotor2vr VERSION 0.1.0 LANGUAGES CXX)
+project(kotor2vr VERSION 0.1.1 LANGUAGES CXX)
 
 # Portable native binaries do not require an installed Visual C++ runtime.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -17,6 +17,7 @@ add_library(kotor2vr-common STATIC
   src/common/build_descriptor.cpp
   src/common/hook_validation.cpp
   src/common/stereo_stream.cpp
+  src/common/movie_frame.cpp
   src/common/vr_input.cpp
   src/common/shared_memory_channel.cpp)
 
@@ -36,6 +37,13 @@ else()
 endif()
 
 if(BUILD_TESTING)
+  add_executable(kotor2vr-movie-frame-tests tests/movie_frame_tests.cpp)
+  target_link_libraries(kotor2vr-movie-frame-tests PRIVATE kotor2vr-common)
+  add_test(NAME movie-frame COMMAND kotor2vr-movie-frame-tests)
+  add_executable(kotor2vr-bink-summary-guard-tests tests/bink_summary_guard_tests.cpp)
+  target_compile_features(kotor2vr-bink-summary-guard-tests PRIVATE cxx_std_20)
+  target_include_directories(kotor2vr-bink-summary-guard-tests PRIVATE src/game32)
+  add_test(NAME bink-summary-guard COMMAND kotor2vr-bink-summary-guard-tests)
   add_executable(kotor2vr-controller-input-filter-tests tests/controller_input_filter_tests.cpp)
   target_compile_features(kotor2vr-controller-input-filter-tests PRIVATE cxx_std_20)
   target_include_directories(kotor2vr-controller-input-filter-tests PRIVATE src/game32)
@@ -69,6 +77,8 @@ elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
   file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/kotor2vr-camera.ini"
        INPUT "${CMAKE_SOURCE_DIR}/kotor2vr-camera.ini")
   add_library(kotor2vr-game32 SHARED
+    src/game32/bink_movie.cpp
+    src/game32/bink_summary_guard.cpp
     src/game32/dll_main.cpp
     src/game32/controller_input.cpp
     src/game32/probe.cpp
@@ -98,6 +108,9 @@ elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
   endif()
 
   if(BUILD_TESTING)
+    add_executable(kotor2vr-bink-summary-live-smoke tests/bink_summary_live_smoke.cpp src/game32/bink_summary_guard.cpp)
+    target_compile_features(kotor2vr-bink-summary-live-smoke PRIVATE cxx_std_20)
+    target_include_directories(kotor2vr-bink-summary-live-smoke PRIVATE src/game32)
     # Explicit hardware smoke test; a hidden real OpenGL context is required.
     add_executable(kotor2vr-gl-context-rebind-live-smoke
       tests/gl_context_rebind_live_smoke.cpp

@@ -59,7 +59,7 @@ bool ResampleBgra8(const GameImageFrame& source,
                    const Extent2D destination_extent,
                    const std::span<std::uint8_t> destination,
                    const std::uint32_t destination_stride,
-                   const BgraUploadTarget target) noexcept {
+                   const BgraUploadTarget target, const bool preserve_aspect) noexcept {
     if (!source.valid() || !destination_extent.valid() ||
         target == BgraUploadTarget::Unsupported ||
         destination_extent.width >
@@ -73,19 +73,27 @@ bool ResampleBgra8(const GameImageFrame& source,
         return false;
     }
 
+    std::uint32_t fit_width=destination_extent.width,fit_height=destination_extent.height;
+    if(preserve_aspect){
+        if(std::uint64_t(source.width)*fit_height>std::uint64_t(source.height)*fit_width)
+            fit_height=std::max(1U,static_cast<std::uint32_t>(std::uint64_t(fit_width)*source.height/source.width));
+        else fit_width=std::max(1U,static_cast<std::uint32_t>(std::uint64_t(fit_height)*source.width/source.height));
+    }
+    const auto left=(destination_extent.width-fit_width)/2,top=(destination_extent.height-fit_height)/2;
     const std::size_t source_stride = static_cast<std::size_t>(source.width) * 4U;
     for (std::uint32_t y = 0; y < destination_extent.height; ++y) {
         const std::uint32_t source_y = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(y) * source.height /
-            destination_extent.height);
+            static_cast<std::uint64_t>(y>=top ? y-top:0) * source.height / fit_height);
         const std::uint8_t* const source_row =
-            source.pixels.data() + static_cast<std::size_t>(source_y) * source_stride;
+            source.pixels.data() + static_cast<std::size_t>(std::min(source_y,source.height-1)) * source_stride;
         std::uint8_t* const destination_row =
             destination.data() + static_cast<std::size_t>(y) * destination_stride;
         for (std::uint32_t x = 0; x < destination_extent.width; ++x) {
+            if(x<left || x-left>=fit_width || y<top || y-top>=fit_height){
+                auto* output=destination_row+x*4U;output[0]=output[1]=output[2]=0;output[3]=255;continue;
+            }
             const std::uint32_t source_x = static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(x) * source.width /
-                destination_extent.width);
+                static_cast<std::uint64_t>(x-left) * source.width / fit_width);
             const std::uint8_t* const input = source_row + source_x * 4U;
             std::uint8_t* const output = destination_row + x * 4U;
             if (target == BgraUploadTarget::Bgra8) {
@@ -169,11 +177,11 @@ bool D3D12BgraUpload::Initialize(ID3D12Device* const device,
 
 bool D3D12BgraUpload::Record(ID3D12GraphicsCommandList* const command_list,
                              ID3D12Resource* const destination,
-                             const GameImageFrame& frame) noexcept {
+                             const GameImageFrame& frame,const bool preserve_aspect) noexcept {
     if (!ready() || command_list == nullptr || destination == nullptr ||
         !ResampleBgra8(frame, impl_->extent,
                        {impl_->mapped, static_cast<std::size_t>(impl_->layout.byte_size)},
-                       impl_->layout.row_pitch, impl_->target)) {
+                       impl_->layout.row_pitch, impl_->target,preserve_aspect)) {
         return false;
     }
 

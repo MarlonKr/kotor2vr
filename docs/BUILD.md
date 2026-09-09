@@ -1,4 +1,4 @@
-# Build the 0.1.0 early preview
+# Build the 0.1.1 early preview
 
 Use 64-bit Windows with Git (for repository checkouts), Visual Studio 2022 C++ Build Tools including x86/x64 tools, a Windows SDK, CMake 3.25 or newer, and the .NET 8 SDK. The default presets use Visual Studio 2022. Network access to NuGet is needed for the initial launcher restore.
 
@@ -6,7 +6,7 @@ Download the source archive from the same release as the binary ZIP, or check ou
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/Build.ps1 -Configuration Release -MaxParallel 1
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/Package.ps1 -SkipBuild -Version 0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/Package.ps1 -SkipBuild -Version 0.1.1
 ```
 
 The first command builds x64 host and x86 game module, runs offline CTest suites, verifies their PE architecture/exports and static OpenXR loader, then publishes a self-contained x86 launcher and runs launcher self-tests. It does not launch KOTOR or create a VR session. The second creates binary and source ZIPs under `dist` and includes SHA-256 file manifests. Existing version output directories are not overwritten; use a new candidate version for a revised build.

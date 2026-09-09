@@ -94,15 +94,36 @@ struct HmdCameraPoseResult {
             pose.orientation_w};
 }
 
-// The regular follow camera supplies its real target position; gameplay eye
-// height is calibrated explicitly, without relying on a guessed camera distance.
-// Remove the monitor camera's downward pitch but preserve its horizontal heading.
+// Hook positions are world-space engine coordinates, exactly as returned by
+// Gob::GetHook in the original gameplay FreeLook camera. No body-height guess.
+enum class FirstPersonHook : std::uint8_t { None, FreeLook, Camera };
+struct FirstPersonEye {
+    FirstPersonHook hook{FirstPersonHook::None};
+    math::Vec3 world{};
+};
+[[nodiscard]] inline bool ValidFirstPersonEye(math::Vec3 feet, math::Vec3 eye) noexcept {
+    if (!math::IsFinite(feet) || !math::IsFinite(eye)) return false;
+    const auto delta=eye-feet;
+    // Broad corruption guards in engine units, independent of XR world scale.
+    return delta.z>=0.05F && delta.z<=4.0F &&
+        delta.x*delta.x+delta.y*delta.y<=4.0F;
+}
+[[nodiscard]] inline FirstPersonEye SelectFirstPersonEye(math::Vec3 feet,
+    bool free_look_found, math::Vec3 free_look, bool camera_found, math::Vec3 camera) noexcept {
+    if (free_look_found && ValidFirstPersonEye(feet,free_look))
+        return {FirstPersonHook::FreeLook,free_look};
+    if (camera_found && ValidFirstPersonEye(feet,camera))
+        return {FirstPersonHook::Camera,camera};
+    return {};
+}
+
+// Remove monitor-camera pitch but preserve horizontal heading. Scale only the
+// optional physical forward adjustment, never the already-world-space eye.
 [[nodiscard]] inline HmdCameraPoseResult ComposeFirstPersonAnchor(
-    const EngineCameraPoseWxyz& authored, math::Vec3 target,
-    float units_per_metre, float height_m, float forward_m) noexcept {
+    const EngineCameraPoseWxyz& authored, math::Vec3 eye,
+    float units_per_metre, float forward_m) noexcept {
     if (!IsConservativeUnitQuaternion(EngineCameraQuaternion(authored)) ||
-        !math::IsFinite(target) || !std::isfinite(units_per_metre) || units_per_metre<=0 ||
-        !std::isfinite(height_m) || height_m<0.2F || height_m>3.0F ||
+        !math::IsFinite(eye) || !std::isfinite(units_per_metre) || units_per_metre<=0 ||
         !std::isfinite(forward_m) || forward_m<0 || forward_m>0.5F) return {};
     auto forward=math::Rotate(EngineCameraQuaternion(authored),{0,0,-1});
     forward.z=0;
@@ -111,10 +132,9 @@ struct HmdCameraPoseResult {
     forward=forward/length;
     const auto heading=math::FromAxisAngle({0,0,1},std::atan2(-forward.x,forward.y));
     const auto upright=math::Multiply(heading,math::FromAxisAngle({1,0,0},math::kPi*0.5F));
-    target=target+forward*(forward_m*units_per_metre);
-    target.z+=height_m*units_per_metre;
-    if (!math::IsFinite(target)) return {};
-    return {true,{target.x,target.y,target.z,upright.w,upright.x,upright.y,upright.z}};
+    eye=eye+forward*(forward_m*units_per_metre);
+    if (!math::IsFinite(eye)) return {};
+    return {true,{eye.x,eye.y,eye.z,upright.w,upright.x,upright.y,upright.z}};
 }
 
 // Camera orientation already maps camera-local OpenGL axes into world space.

@@ -1,5 +1,6 @@
 #include "stereo_stream.hpp"
 #include "../src/game32/render_trace.hpp"
+#include "../src/game32/native_stereo.hpp"
 #include "../src/game32/stereo_request_gate.hpp"
 #include "../src/host64/include/kotorvr/host/stereo_resolution.hpp"
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +30,99 @@ int main(int argc,char** argv) {
         std::cout<<"Eye resolution environment "<<(failures ? "FAIL":"PASS")<<" percent="<<expected<<'\n';
         return failures ? 1:0;
     }
+    int controlled_object{},nearby_object{};
+    check(game32::ShouldHideFirstPersonObjectDraw(true,0,&controlled_object,&controlled_object),
+        "controlled model scope is eligible for per-mesh filtering in the first eye");
+    check(!game32::ShouldHideFirstPersonObjectDraw(true,0,&controlled_object,&nearby_object),
+        "nearby actors, scenery and independently rendered attachments remain visible");
+    check(!game32::ShouldHideFirstPersonObjectDraw(false,0,&controlled_object,&controlled_object) &&
+        !game32::ShouldHideFirstPersonObjectDraw(true,-1,&controlled_object,&controlled_object) &&
+        !game32::ShouldHideFirstPersonObjectDraw(true,1,&controlled_object,&controlled_object) &&
+        !game32::ShouldHideFirstPersonObjectDraw(true,0,nullptr,nullptr) &&
+        !game32::ShouldHideFirstPersonObjectDraw(true,0,&controlled_object,nullptr),
+        "disabled/authored/monitor passes, replays and missing object scopes never select a new hidden draw");
+    int head_object{},head_hook{},hand_hook{},head_accessory{},other_head{},other_hook{};
+    using HeadLink=game32::EgoHeadAttachmentLink;
+    const std::array<HeadLink,1> human_head{{{&head_object,&controlled_object,&head_hook,true}}};
+    check(game32::ControlledHeadAttachment(&controlled_object,&head_hook,&head_object,human_head),
+        "separate human head bound to the controlled body's HeadHook is selected");
+    // Original pmbam Torso/LArm/RArm use 3081/1092/1068 indices.
+    // None may qualify merely because they share a skinned shader or nearby pivot.
+    check(!game32::ControlledHeadAttachment(&controlled_object,&head_hook,&controlled_object,{}) &&
+        !game32::ControlledHeadAttachment(&controlled_object,&head_hook,&controlled_object,human_head),
+        "human body Gob including torso, arms and legs stays visible");
+    const std::array<HeadLink,1> weapon{{{&nearby_object,&controlled_object,&hand_hook,true}}};
+    const std::array<HeadLink,1> foreign{{{&other_head,&nearby_object,&other_hook,true}}};
+    check(!game32::ControlledHeadAttachment(&controlled_object,&head_hook,&nearby_object,weapon) &&
+        !game32::ControlledHeadAttachment(&controlled_object,&head_hook,&other_head,foreign),
+        "hand-bound weapons and other characters' heads remain visible");
+    const std::array<HeadLink,2> accessory{{
+        {&head_accessory,&head_object,&other_hook,true},human_head[0]}};
+    check(game32::ControlledHeadAttachment(&controlled_object,&head_hook,&head_accessory,accessory),
+        "verified accessories beneath the controlled head are selected");
+    for (unsigned bad=0;bad<5;++bad) {
+        auto broken=human_head;
+        if (bad==0) broken[0].supported=false;
+        if (bad==1) broken[0].child=&other_head;
+        if (bad==2) broken[0].parent=nullptr;
+        if (bad==3) broken[0].node=nullptr;
+        if (bad==4) broken[0].parent=&head_object;
+        check(!game32::ControlledHeadAttachment(&controlled_object,&head_hook,&head_object,broken),
+            "unsupported, stale, null or self-referencing attachment links remain visible");
+    }
+    check(!game32::ControlledHeadAttachment(&controlled_object,nullptr,&head_object,human_head),
+        "missing HeadHook never falls back to body/proximity hiding");
+    const std::array<HeadLink,3> cycle{{
+        {&head_accessory,&head_object,&other_hook,true},
+        {&head_object,&head_accessory,&other_hook,true},
+        {&head_accessory,&controlled_object,&head_hook,true}}};
+    check(!game32::ControlledHeadAttachment(&controlled_object,&head_hook,&head_accessory,cycle),
+        "cyclic or inconsistent ancestry is rejected");
+    int chain_objects[10]{};
+    std::array<HeadLink,9> deep{};
+    for (unsigned i=0;i<deep.size();++i) deep[i]={&chain_objects[i],
+        i+1==deep.size() ? static_cast<const void*>(&controlled_object):&chain_objects[i+1],&head_hook,true};
+    check(!game32::ControlledHeadAttachment(&controlled_object,&head_hook,&chain_objects[0],deep),
+        "attachment traversal is capped at eight links");
+    check(game32::ShortEgoModel({0,0,0},{0,0,0.8F}) &&
+        game32::ShortEgoModel({100,-20,30},{100,-20,30.8F}) &&
+        !game32::ShortEgoModel({0,0,0},{0,0,1.635F}) &&
+        !game32::ShortEgoModel({0,0,0},{0,0,1.2F}) &&
+        !game32::ShortEgoModel({0,0,0},{0,0,0}),
+        "model-height dispatch covers T3 and shifted map origins, preserving normal-height selection");
+    // Rounded root-space pivots from the original p_t3m4 MDL bind pose. Head
+    // has 439 faces; Eyes has 46 and shares its pivot. The upper gun is a
+    // separate descendant with its own pivot, not part of this selection.
+    game32::EgoMeshSelection t3{};
+    t3.short_model=true; t3.head_pivot_mask=3;
+    const math::Vec3 t3_head{0.0019F,0.0116F,0.7119F};
+    t3.head_pivots[0]=t3.head_pivots[1]=t3_head;
+    check(game32::NamedEgoHeadPivot(t3,t3_head),
+        "large low T3 Head and co-located Eyes qualify without shader or 768-index assumptions");
+    for (const math::Vec3 part:std::array<math::Vec3,5>{{
+        {0.0019F,-0.3586F,0.1200F}, // chassis
+        {-0.2661F,0.0100F,0.5075F}, // left arm/leg
+        {-0.2621F,0.4100F,0.0795F}, // front foot
+        {0.0019F,0.0079F,0.5684F}, // neck
+        {0.0257F,-0.0460F,0.8174F}, // upper gun arm
+    }}) check(!game32::NamedEgoHeadPivot(t3,part),
+        "original T3 chassis/leg/foot/neck/top-gun pivots remain visible");
+    check(game32::NamedEgoHeadPivot(t3,t3_head+math::Vec3{0.019F,0,0}) &&
+        !game32::NamedEgoHeadPivot(t3,t3_head+math::Vec3{0.021F,0,0}),
+        "head-pivot tolerance is limited to 0.02 engine units");
+    const auto animated_head=t3_head+math::Vec3{0.12F,-0.07F,0.04F};
+    t3.head_pivots[0]=t3.head_pivots[1]=animated_head;
+    check(game32::NamedEgoHeadPivot(t3,animated_head) &&
+        !game32::NamedEgoHeadPivot(t3,t3_head),
+        "refreshing named pivots follows animation and rejects a stale bind-pose position");
+    t3.head_pivot_mask=0;
+    check(!game32::NamedEgoHeadPivot(t3,animated_head),"missing named head hooks retain visibility");
+    t3.head_pivot_mask=1; t3.head_pivots[0].z=std::numeric_limits<float>::quiet_NaN();
+    check(!game32::NamedEgoHeadPivot(t3,animated_head),
+        "nonfinite pivots and model transforms are never hidden");
+    t3.head_pivots[0]={0,0,1.7F}; t3.short_model=false;
+    check(!game32::NamedEgoHeadPivot(t3,t3.head_pivots[0]),
+        "tall integrated models do not receive short-model pivot filtering");
     // Initialize the cached snapshot with fixed eyes, then mutate both environment inputs.
     check(_putenv_s("KOTOR2VR_EYE_RESOLUTION","2040x2232")==0,"set fixed test environment");
     check(_putenv_s("KOTOR2VR_EYE_PERCENT","bad")==0,"fixed mode overrides invalid percent");
@@ -253,22 +347,49 @@ int main(int argc,char** argv) {
     authored.position_x=10; authored.position_y=20; authored.position_z=30;
     // Authored camera maps camera-local Y-up to the engine's world Z-up.
     authored.orientation_w=std::sqrt(0.5F); authored.orientation_x=std::sqrt(0.5F);
-    const auto first=game32::ComposeFirstPersonAnchor(authored,{10,20,30},1,1.65F,0.10F);
-    check(first.valid && close(first.pose.position_x,10) && close(first.pose.position_y,20.10F) &&
-        close(first.pose.position_z,31.65F),"first person follows actual player position at configured eye height");
+    // Synthetic model-hook fixtures: verify character-dependent height without
+    // claiming a measured in-game height for these models.
+    const math::Vec3 feet{10,20,30}, human_eye{10,20,31.65F}, droid_eye{10,20,30.8F};
+    const auto human=game32::SelectFirstPersonEye(feet,true,human_eye,true,droid_eye);
+    const auto droid=game32::SelectFirstPersonEye(feet,true,droid_eye,false,{});
+    check(human.hook==game32::FirstPersonHook::FreeLook && close(human.world.z,31.65F),
+        "FreeLookHook takes precedence over CameraHook");
+    const auto first=game32::ComposeFirstPersonAnchor(authored,human.world,1,0.10F);
+    const auto short_first=game32::ComposeFirstPersonAnchor(authored,droid.world,1,0.10F);
+    check(first.valid && short_first.valid && close(first.pose.position_x,10) &&
+        close(first.pose.position_y,20.10F) && close(first.pose.position_z,31.65F) &&
+        close(short_first.pose.position_z,30.8F),"each actor retains its own model eye height");
+    const auto secondary=game32::SelectFirstPersonEye(feet,false,{},true,human_eye);
+    check(secondary.hook==game32::FirstPersonHook::Camera,
+        "CameraHook is used when FreeLookHook is absent");
+    const float nan=std::numeric_limits<float>::quiet_NaN();
+    const auto invalid_primary=game32::SelectFirstPersonEye(feet,true,{nan,20,31},true,droid_eye);
+    check(invalid_primary.hook==game32::FirstPersonHook::Camera && close(invalid_primary.world.z,30.8F),
+        "invalid primary hook falls back to the current actor's CameraHook");
+    const auto missing=game32::SelectFirstPersonEye(feet,false,human_eye,false,droid_eye);
+    check(missing.hook==game32::FirstPersonHook::None && close(missing.world.z,0),
+        "missing hooks after actor switch cannot retain the previous actor eye");
+    check(game32::SelectFirstPersonEye(feet,true,{10,20,300},true,{20,20,31}).hook==game32::FirstPersonHook::None &&
+        game32::SelectFirstPersonEye({nan,20,30},true,human_eye,false,{}).hook==game32::FirstPersonHook::None &&
+        game32::SelectFirstPersonEye(feet,true,feet,false,{}).hook==game32::FirstPersonHook::None,
+        "nonfinite feet, implausible hooks and root-at-feet are rejected");
+    const auto shifted=game32::SelectFirstPersonEye({-100,200,-50},true,{-100,200,-49.2F},false,{});
+    check(shifted.hook==game32::FirstPersonHook::FreeLook && close(shifted.world.z,-49.2F),
+        "eye validation is relative to feet and independent of map origin");
     auto pitched=authored;
     const auto pitched_q=math::Multiply(math::FromAxisAngle({0,0,1},math::kPi*0.5F),
         math::FromAxisAngle({1,0,0},math::kPi/3));
     pitched.orientation_w=pitched_q.w; pitched.orientation_x=pitched_q.x;
     pitched.orientation_y=pitched_q.y; pitched.orientation_z=pitched_q.z;
-    const auto level=game32::ComposeFirstPersonAnchor(pitched,{10,20,30},2,1.65F,0.10F);
+    const auto level=game32::ComposeFirstPersonAnchor(pitched,human.world,2,0.10F);
     const auto level_forward=math::Rotate(game32::EngineCameraQuaternion(level.pose),{0,0,-1});
-    check(level.valid && close(level_forward.x,-1) && close(level_forward.z,0) &&
-        close(level.pose.position_x,9.8F) && close(level.pose.position_z,33.3F),
-        "first person removes chase pitch, preserves heading and applies metre scale");
-    check(!game32::ComposeFirstPersonAnchor(authored,{0,0,0},1,-1,0).valid &&
-        !game32::ComposeFirstPersonAnchor(authored,{0,0,std::numeric_limits<float>::quiet_NaN()},1,1.65F,0).valid,
-        "invalid first-person target or calibration is rejected");
+    const auto level_up=math::Rotate(game32::EngineCameraQuaternion(level.pose),{0,1,0});
+    check(level.valid && close(level_forward.x,-1) && close(level_forward.z,0) && close(level_up.z,1) &&
+        close(level.pose.position_x,9.8F) && close(level.pose.position_z,31.65F),
+        "heading stays upright; scale affects forward offset without scaling or double-adding eye height");
+    check(!game32::ComposeFirstPersonAnchor(authored,human_eye,-1,0).valid &&
+        !game32::ComposeFirstPersonAnchor(authored,{0,0,nan},1,0).valid,
+        "invalid world eye or scale is rejected");
     const auto left=game32::ComposeStereoEyePose(authored,baseline,request,0);
     const auto right=game32::ComposeStereoEyePose(authored,baseline,request,1);
     check(left.valid && right.valid && close(right.pose.position_x-left.pose.position_x,0.064F),"64mm IPD survives authored rotation");

@@ -7,6 +7,7 @@
 
 #include "gpu_stream_producer.hpp"
 #include "probe.hpp"
+#include "bink_movie.hpp"
 
 #if defined(_WIN32)
 
@@ -51,6 +52,8 @@ using SwapBuffersFunction=BOOL(WINAPI*)(HDC);
 SwapBuffersFunction g_original_swap_buffers{};
 using DeleteContextFunction=BOOL(WINAPI*)(HGLRC);
 DeleteContextFunction g_original_delete_context{};
+std::atomic_bool g_log_context_recovery_surface=false;
+[[nodiscard]] bool LogFormat(const char* format, ...) noexcept;
 BOOL WINAPI CaptureDeleteContext(HGLRC context) {
     const BOOL result=g_original_delete_context(context);
     const DWORD error=GetLastError();
@@ -58,22 +61,39 @@ BOOL WINAPI CaptureDeleteContext(HGLRC context) {
         NotifyGpuStreamContextDeleted(context);
         NotifyNativeStereoContextDeleted(context);
         NotifySceneReplayContextDeleted(context);
+        g_log_context_recovery_surface=true;
     }
     SetLastError(error);
     return result;
 }
-BOOL WINAPI CaptureSwapBuffers(HDC dc) {
+void RecoverContextsForWindow(HDC dc,const char* source) noexcept {
+    if (!NativeStereoContextRecoveryPending() && !GpuStreamContextRecoveryPending()) return;
+    const HDC current_dc=wglGetCurrentDC();
+    const HGLRC context=wglGetCurrentContext();
+    const HWND current_window=WindowFromDC(current_dc);
     const HWND window=WindowFromDC(dc);
     DWORD process{};
     const DWORD thread=window ? GetWindowThreadProcessId(window,&process) : 0;
-    // Rebind only on a real game-window present after confirmed destruction,
-    // never on a temporary offscreen/overlay context.
-    if (wglGetCurrentDC()==dc && wglGetCurrentContext() && window &&
-        IsWindowVisible(window) && thread==GetCurrentThreadId() &&
-        process==GetCurrentProcessId()) {
+    const bool eligible=IsGameContextRecoverySurface(
+        reinterpret_cast<std::uintptr_t>(context),
+        reinterpret_cast<std::uintptr_t>(current_window),
+        reinterpret_cast<std::uintptr_t>(window),
+        window && IsWindowVisible(window),process,GetCurrentProcessId());
+    if (g_log_context_recovery_surface.exchange(false)) {
+        (void)LogFormat("gl-context-recovery-surface source=%s eligible=%u context=%p current_dc=%p target_dc=%p current_window=%p target_window=%p window_thread=%lu render_thread=%lu window_process=%lu",
+            source,eligible ? 1U:0U,context,current_dc,dc,current_window,window,
+            thread,GetCurrentThreadId(),process);
+    }
+    // Neither a transient offscreen context nor another window's present can
+    // select a replacement. Producers additionally require confirmed deletion
+    // and their original GL owner thread; numeric context reuse is allowed.
+    if (eligible) {
         RecoverGpuStreamContext();
         RecoverNativeStereoContext();
     }
+}
+BOOL WINAPI CaptureSwapBuffers(HDC dc) {
+    RecoverContextsForWindow(dc,"present");
     FinishNativeStereoPresent();
     if (g_capture_at_present && IsGpuStreamProducerRunning()) {
         const auto id=static_cast<std::uint32_t>(InterlockedIncrement(&g_scene_frame_id));
@@ -360,6 +380,10 @@ void PublishGpuStreamDiagnostic(
 
 } // namespace
 
+void RecoverGameImageContextsForScene() noexcept {
+    RecoverContextsForWindow(wglGetCurrentDC(),"world-camera");
+}
+
 GameImageCaptureResult ArmGameImageCapture(void* bootstrap_v1) noexcept {
     GameImageSmokeBootstrapV1 copied{};
     if (!CopyBootstrapSeh(bootstrap_v1, copied)) {
@@ -533,7 +557,7 @@ bool InstallGameImagePresentCapture() noexcept {
     const bool ready=present_ready && deletion_ready &&
         g_original_swap_buffers && g_original_delete_context;
     if (ready) gpu_timing::ArmAfterDeletionHookInstalled();
-    return ready;
+    return ready && InstallBinkMovieHooks(g_bootstrap.session_nonce);
 }
 
 } // namespace k2vr::game32
@@ -547,6 +571,7 @@ GameImageCaptureResult ArmGameImageCapture(void*) noexcept {
 }
 
 void CancelGameImageCaptureArm() noexcept {}
+void RecoverGameImageContextsForScene() noexcept {}
 void GameImageCaptureAfterScenePass() noexcept {}
 
 } // namespace k2vr::game32

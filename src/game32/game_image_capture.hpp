@@ -86,6 +86,17 @@ enum class GameImageCapturePolicy : std::uint8_t {
     Suppressed = 2,
 };
 
+// A window may be rendered by a different thread from the one that created
+// it, and two DC handles may refer to that same window. GL resource ownership
+// is checked separately by each producer against its original render thread.
+[[nodiscard]] constexpr bool IsGameContextRecoverySurface(
+    std::uintptr_t context, std::uintptr_t current_window,
+    std::uintptr_t target_window, bool visible,
+    std::uint32_t window_process, std::uint32_t current_process) noexcept {
+    return context && current_window && current_window == target_window &&
+        visible && window_process && window_process == current_process;
+}
+
 namespace detail {
 
 inline thread_local GameImageCapturePolicy g_game_image_capture_policy =
@@ -209,6 +220,9 @@ void CancelGameImageCaptureArm() noexcept;
 // engine state and becomes a cheap no-op unless the F7 diagnostic is armed.
 void GameImageCaptureAfterScenePass() noexcept;
 [[nodiscard]] bool InstallGameImagePresentCapture() noexcept;
+// The verified world-camera entry is another safe boundary after a graphics
+// reset, even when the replacement renderer has not used our present import.
+void RecoverGameImageContextsForScene() noexcept;
 
 static_assert(sizeof(GameImageSmokeBootstrapV1) == 32);
 static_assert(offsetof(GameImageSmokeBootstrapV1, session_nonce) == 8);
