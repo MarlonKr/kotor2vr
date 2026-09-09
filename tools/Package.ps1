@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.1.1',
     [switch]$SkipBuild,
     [ValidateRange(1,32)]
     [int]$MaxParallel = 1

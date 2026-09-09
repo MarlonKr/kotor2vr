@@ -6,7 +6,9 @@
 #include "kotorvr/host/neural_reprojection.hpp"
 #include "kotorvr/host/composition_depth.hpp"
 #include "kotorvr/host/stereo_resolution.hpp"
+#include "kotorvr/host/ui_pose.hpp"
 #include "stereo_stream.hpp"
+#include "movie_frame.hpp"
 #include "vr_input.hpp"
 #include "kotorvr/host/visible_smoke.hpp"
 
@@ -42,6 +44,11 @@ namespace {
 inline constexpr float game_image_quad_width_m = 3.2F;
 inline constexpr float game_image_quad_height_m = 1.8F;
 inline constexpr float game_image_quad_distance_m = 1.0F;
+
+XrPosef ToXrPose(const k2vr::math::Pose& pose) noexcept {
+    return {{pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w},
+        {pose.position.x,pose.position.y,pose.position.z}};
+}
 
 static_assert(static_cast<std::int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ==
               smoke_format_rgba8_srgb);
@@ -250,9 +257,16 @@ struct OpenXrRuntime::Impl {
     Extent2D recommended_view_extent{};
     Extent2D maximum_swapchain_extent{};
     Extent2D maximum_view_extent{};
-    XrPosef current_head_pose{{0,0,0,1},{0,0,0}};
+    k2vr::math::Pose upright_ui_head{};
+    float ui_head_yaw{};
+    bool have_ui_head{},previous_movie_theater{},ui_pose_warning_logged{};
     XrPosef theater_pose{{0,0,0,1},{0,0,-1.5F}};
     bool previous_theater{},force_theater{},theater_key_was_down{},recenter_was_down{};
+    k2vr::ipc::MovieFrameChannel movie_channel;
+    k2vr::ipc::MovieFrame movie_snapshot;
+    GameImageFrame movie_image;
+    bool movie_was_active{};
+    std::chrono::steady_clock::time_point next_movie_open_attempt{};
     bool hud_visible{true},hud_key_was_down{};
 
     struct VisibleSmokeResources {
@@ -823,11 +837,31 @@ bool OpenXrRuntime::locate_views(const XrFrameToken& token, LocatedViews& views)
                            source.fov.angleDown};
     }
     if (views.orientation_valid) {
-        impl_->current_head_pose=xr_views[0].pose;
-        impl_->current_head_pose.position={
-            (xr_views[0].pose.position.x+xr_views[1].pose.position.x)*0.5F,
-            (xr_views[0].pose.position.y+xr_views[1].pose.position.y)*0.5F,
-            (xr_views[0].pose.position.z+xr_views[1].pose.position.z)*0.5F};
+        // Locate the head's VIEW space itself: an individual eye may have a
+        // calibrated cant and is not the reference orientation for level UI.
+        XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+        const auto head_result=xrLocateSpace(impl_->view_space,impl_->local_space,
+            token.predicted_display_time_ns,&head);
+        constexpr XrSpaceLocationFlags required=XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+            XR_SPACE_LOCATION_POSITION_VALID_BIT;
+        if (XR_SUCCEEDED(head_result) && (head.locationFlags&required)==required) {
+            const auto& p=head.pose;
+            const auto upright=MakeUprightUiHead({{p.position.x,p.position.y,p.position.z},
+                {p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w}},impl_->ui_head_yaw);
+            if (upright.valid) {
+                if (!impl_->have_ui_head)
+                    impl_->logger->write(LogLevel::info,"ui_horizon_alignment_ready",
+                        "UI follows gaze yaw and pitch while remaining level");
+                impl_->upright_ui_head=upright.pose; impl_->ui_head_yaw=upright.yaw;
+                impl_->have_ui_head=true; impl_->ui_pose_warning_logged=false;
+            }
+        } else if (!impl_->ui_pose_warning_logged) {
+            impl_->logger->write(LogLevel::warning,"ui_head_pose_unavailable",
+                "A valid head pose is unavailable; retaining the last level UI pose",
+                {{"xr_result",std::to_string(head_result)},
+                 {"location_flags",std::to_string(head.locationFlags)}});
+            impl_->ui_pose_warning_logged=true;
+        }
     }
     return views.orientation_valid;
 #endif
@@ -1229,6 +1263,31 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
         impl_->hud_key_was_down = hud_down;
     }
 
+    bool movie_active=false;
+    if(impl_->visible_smoke.native_stereo && impl_->theater_smoke.ready){
+        const auto now=std::chrono::steady_clock::now();
+        if(now>=impl_->next_movie_open_attempt){
+            (void)impl_->movie_channel.Open(impl_->visible_smoke.game_image_nonce,false);
+            impl_->next_movie_open_attempt=now+std::chrono::milliseconds(100);
+        }
+        const auto read=impl_->movie_channel.ReadLatest(impl_->movie_snapshot);
+        if(read==k2vr::ipc::MovieRead::Fresh){
+            auto& image=impl_->movie_image;const auto& snapshot=impl_->movie_snapshot;
+            image.width=snapshot.width;image.height=snapshot.height;
+            image.frame_id=snapshot.sequence;image.sequence=static_cast<std::uint32_t>(snapshot.sequence) | 1U;
+            image.pixels.swap(impl_->movie_snapshot.pixels);
+        }
+        movie_active=(read==k2vr::ipc::MovieRead::Fresh || read==k2vr::ipc::MovieRead::Unchanged ||
+            (read==k2vr::ipc::MovieRead::Unavailable && impl_->movie_was_active &&
+             GetTickCount64()>=impl_->movie_snapshot.tick_ms &&
+             GetTickCount64()-impl_->movie_snapshot.tick_ms<=k2vr::ipc::kMovieFrameTimeoutMs)) && impl_->movie_image.valid();
+        if(movie_active!=impl_->movie_was_active){
+            impl_->logger->write(LogLevel::info,"bink_movie_presentation",movie_active ?
+                "Showing decoded movie frames in the headset theater":"Movie ended; returning to normal VR presentation",
+                {{"width",std::to_string(impl_->movie_image.width)},{"height",std::to_string(impl_->movie_image.height)}});
+            impl_->movie_was_active=movie_active;
+        }
+    }
     bool theater=false;
     if (impl_->visible_smoke.native_stereo && impl_->theater_smoke.ready) {
         const bool down=k2vr::input::TheaterDown();
@@ -1236,16 +1295,14 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
         impl_->theater_key_was_down=down;
         auto& metadata=impl_->visible_smoke.stereo_metadata;
         const bool world=metadata.Open(impl_->visible_smoke.game_image_nonce,false) && metadata.WorldRecentlyRendered();
-        theater=impl_->force_theater || !world;
+        theater=movie_active || impl_->force_theater || !world;
         const bool recenter=k2vr::input::RecenterDown();
-        if (theater && (!impl_->previous_theater || (recenter && !impl_->recenter_was_down))) {
-            impl_->theater_pose=impl_->current_head_pose;
-            const auto& q=impl_->theater_pose.orientation;
-            const auto offset=k2vr::math::Rotate({q.x,q.y,q.z,q.w},{0,0,-1.5F});
-            impl_->theater_pose.position.x+=offset.x;
-            impl_->theater_pose.position.y+=offset.y;
-            impl_->theater_pose.position.z+=offset.z;
+        if (theater && impl_->have_ui_head && (!impl_->previous_theater ||
+            (movie_active && !impl_->previous_movie_theater) ||
+            (recenter && !impl_->recenter_was_down))) {
+            impl_->theater_pose=ToXrPose(PlaceUiPanel(impl_->upright_ui_head,1.5F));
         }
+        impl_->previous_movie_theater=movie_active;
         impl_->recenter_was_down=recenter;
         impl_->previous_theater=theater;
     }
@@ -1253,7 +1310,7 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
     GpuStreamFrameToken gpu_stream_frame{};
     k2vr::ipc::StereoFrameMetadata candidate_stereo_frame{};
     bool have_gpu_stream_frame = false;
-    if (smoke.game_image_enabled) {
+    if (smoke.game_image_enabled && !movie_active) {
         const auto now = std::chrono::steady_clock::now();
         if (!smoke.gpu_stream.is_open() &&
             now >= smoke.next_gpu_stream_open_attempt) {
@@ -1314,8 +1371,8 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
             }
         }
     }
-    bool use_game_image = false;
-    if (smoke.game_image_enabled) {
+    bool use_game_image = movie_active;
+    if (smoke.game_image_enabled && !movie_active) {
         const auto now = std::chrono::steady_clock::now();
         if (!smoke.game_image_reader.is_open() &&
             now >= smoke.next_game_image_open_attempt) {
@@ -1475,7 +1532,7 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
     ID3D12Resource* const texture = smoke.images[image_index].texture;
     bool gpu_stream_copy_recorded = false;
     bool fresh_gpu_stream_copy_recorded = false;
-    if (have_gpu_stream_frame) {
+    if (have_gpu_stream_frame && !movie_active) {
         GpuStreamConsumerStatus stream_status =
             IsGpuStreamDestinationCompatible(smoke.layout.pixel_extent,
                 smoke.format,(smoke.native_stereo || smoke.auxiliary_theater) ? smoke.layout.pixel_extent :
@@ -1501,7 +1558,7 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
                 smoke.gpu_stream_error_logged = true;
             }
         }
-    } else if (smoke.gpu_stream.has_cached_frame()) {
+    } else if (!movie_active && smoke.gpu_stream.has_cached_frame()) {
         const GpuStreamConsumerStatus stream_status =
             smoke.native_stereo ? GpuStreamConsumerStatus::Ok :
                 smoke.gpu_stream.RecordCachedCopy(smoke.command_list.Get(), texture);
@@ -1629,7 +1686,7 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
         if (use_game_image) {
             game_image_uploaded = smoke.game_image_upload.Record(
                 smoke.command_list.Get(), texture,
-                smoke.game_image_reader.latest());
+                movie_active ? impl_->movie_image:smoke.game_image_reader.latest(),movie_active);
             if (!game_image_uploaded) {
                 D3D12_RESOURCE_BARRIER copy_to_render_target = to_output;
                 copy_to_render_target.Transition.StateBefore =
@@ -1858,6 +1915,9 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
                     : XrExtent2Df{smoke.layout.width_m, smoke.layout.height_m};
     if (smoke.auxiliary_theater) {
         quad.space=impl_->local_space;
+        // Hold the level screen in the room. Entering the menu or pressing
+        // recenter places it along the current gaze; later head motion does
+        // not move it. The captured anchor already excludes head roll.
         quad.pose=impl_->theater_pose;
         quad.size={2.4F,1.35F};
     }
@@ -1902,21 +1962,22 @@ bool OpenXrRuntime::end_frame_visible_smoke(XrFrameToken& token,
         const auto& frame=smoke.cached_stereo_frame;
         // Suppress only the submitted XR HUD layer, including cached neural HUDs.
         // Keep the atlas, monitor UI and theater image intact.
-        if (impl_->hud_visible && frame.hud_width && frame.hud_height && frame.hud_width<=smoke.layout.pixel_extent.width &&
+        if (impl_->hud_visible && impl_->have_ui_head && frame.hud_width && frame.hud_height && frame.hud_width<=smoke.layout.pixel_extent.width &&
             frame.hud_height<=k2vr::ipc::kStereoHudMaximumHeight &&
             std::isfinite(frame.hud_source_aspect) && frame.hud_source_aspect>0.2F && frame.hud_source_aspect<8.0F) {
             hud.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            hud.space=impl_->view_space; hud.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+            hud.space=impl_->local_space; hud.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
             hud.subImage.swapchain=smoke.swapchain;
             hud.subImage.imageRect.offset={0,static_cast<std::int32_t>(rendered.render_height)};
             hud.subImage.imageRect.extent={static_cast<std::int32_t>(frame.hud_width),static_cast<std::int32_t>(frame.hud_height)};
-            hud.pose.orientation.w=1; hud.pose.position.z=-1.5F;
-            hud.size={2.4F,2.4F/frame.hud_source_aspect};
+            hud.pose=ToXrPose(PlaceUiPanel(impl_->upright_ui_head,1.5F));
+            constexpr float hud_center_scale=0.88F;
+            hud.size={2.4F*hud_center_scale,2.4F*hud_center_scale/frame.hud_source_aspect};
             if (rendered.presentation_state==k2vr::ipc::PresentationState::DialogueStereo) {
                 // Bring the original bottom/corner-anchored answers into the
                 // central field without cropping text or changing hit targets.
-                hud.size={1.85F,1.85F/frame.hud_source_aspect};
-                hud.pose.position.y=0.14F;
+                hud.size={1.85F*hud_center_scale,1.85F*hud_center_scale/frame.hud_source_aspect};
+                hud.pose=ToXrPose(PlaceUiPanel(impl_->upright_ui_head,1.5F,0.14F*hud_center_scale));
             }
             layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
         }
@@ -2010,6 +2071,11 @@ void OpenXrRuntime::shutdown() noexcept {
         return;
     }
     impl_->visible_smoke.ready = false;
+    impl_->movie_channel.Close();
+    impl_->movie_snapshot={};impl_->movie_image={};impl_->movie_was_active=false;
+    impl_->next_movie_open_attempt={};
+    impl_->upright_ui_head={}; impl_->ui_head_yaw=0;
+    impl_->have_ui_head=impl_->previous_movie_theater=impl_->ui_pose_warning_logged=false;
     impl_->visible_smoke.compositor_depth.Reset();
     impl_->visible_smoke.game_image_reader.Close();
     impl_->visible_smoke.game_image_upload.Shutdown();

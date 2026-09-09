@@ -6,6 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # The top-level build supplies the full common target. A standalone host
   # still needs the concrete shared-memory channel, not headers alone.
   add_library(kotor2vr-common STATIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common/movie_frame.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/shared_memory_channel.cpp")
   target_compile_features(kotor2vr-common PUBLIC cxx_std_20)
   target_include_directories(kotor2vr-common PUBLIC

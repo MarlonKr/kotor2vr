@@ -2,7 +2,7 @@
 
 Native-engine VR for **Star Wars: Knights of the Old Republic II**, with stereo rendering, head tracking, first/third-person views and a separate VR HUD.
 
-> **0.1.0 — Early preview, work in progress.** This is an early, experimental build, with known bugs and incomplete testing. Reported issues include videos missing in the headset, incorrect first-person height for droids, and a crash when skipping the prologue. Fixes are in progress; a full playthrough and clean-install headset test have not yet been completed.
+> **0.1.1 — Early preview, work in progress.** This update fixes movie playback in the headset, the supported decoder crash when skipping the prologue, character-dependent first-person height, head clipping, graphics-reset recovery and UI placement. Headset testing covered the prologue and parts of Peragus; a full playthrough and installation testing across supported setups remain incomplete.
 
 ## Install and play
 
@@ -20,6 +20,7 @@ The starter uses Steam's registered installation. A copied game folder is not ye
 - 64-bit Windows, Steam, and the Windows Steam/Aspyr executable below.
 - An active OpenXR headset/runtime. Tested development hardware: Quest 3 over USB Quest Link at 72 Hz, NVIDIA RTX 5070 Ti.
 - Other GPUs, headsets, runtimes and game distributions are not yet validated. No universal performance claim is made.
+- Movie capture and the prologue-skip fix require the original `binkw32.dll` (SHA-256 `D963112EA8545C8AAA6BD48A9D2D229605806AE1BBC03F90B0106DB3034466ED`). Replacement decoders are not supported or bundled.
 - Game executable SHA-256: `6A522E71631DCEE93467BD2010F3B23D9145326E1E2E89305F13AB104DBBFFEF` (recorded Steam build 817494). The launcher refuses other executables.
 
 ## Controls
@@ -32,7 +33,7 @@ The starter uses Steam's registered installation. A copied game folder is not ye
 | Show/hide VR HUD | F8 | View + D-pad down |
 | Theater/world | Ctrl + F10 | View + X |
 
-Use normal gamepad or mouse/keyboard controls for gameplay. Menus use a theater view. Dialogue cameras retain their game-authored placement. First-person body hiding may need further coverage across character models. Post-combat movement lock, longer play sessions and minigames remain test items.
+Use normal gamepad or mouse/keyboard controls for gameplay. Menus and movies use a fixed theater screen; recenter places it in your current viewing direction. The gameplay HUD follows your gaze while staying level when you tilt your head sideways. Dialogue cameras retain their game-authored placement. First-person hides verified human head attachments and T3 head/eye meshes while retaining the body and weapons. Other character models, especially combined head/body meshes, need further coverage. Post-combat movement lock, longer play sessions and minigames remain test items.
 
 ## Build it yourself
 

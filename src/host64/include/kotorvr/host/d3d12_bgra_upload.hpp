@@ -41,7 +41,7 @@ enum class BgraUploadTarget : std::uint8_t {
 [[nodiscard]] bool ResampleBgra8(
     const GameImageFrame& source, Extent2D destination_extent,
     std::span<std::uint8_t> destination, std::uint32_t destination_stride,
-    BgraUploadTarget target) noexcept;
+    BgraUploadTarget target, bool preserve_aspect=false) noexcept;
 
 class D3D12BgraUpload final {
 public:
@@ -55,7 +55,7 @@ public:
                                   std::int64_t dxgi_format) noexcept;
     [[nodiscard]] bool Record(ID3D12GraphicsCommandList* command_list,
                               ID3D12Resource* destination,
-                              const GameImageFrame& frame) noexcept;
+                              const GameImageFrame& frame, bool preserve_aspect=false) noexcept;
     void Shutdown() noexcept;
 
     [[nodiscard]] bool ready() const noexcept;

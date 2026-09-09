@@ -55,7 +55,8 @@ bool DepthPack::Initialize() noexcept {
     GLint previous{}; glGetIntegerv(0x8B8D,&previous);
     use_program_(program_); uniform1i(uniform_location(program_,"depthImage"),0);
     use_program_(static_cast<GLuint>(previous));
-    return rectangle_>=0;
+    if (rectangle_<0) { delete_program(program_); program_=0; return false; }
+    return true;
 }
 bool DepthPack::Draw(GLuint texture,GLint x,GLint y,GLsizei width,GLsizei height) noexcept {
     if (!program_ || !texture || width<=0 || height<=0) return false;

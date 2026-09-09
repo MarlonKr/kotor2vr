@@ -1,4 +1,5 @@
 #include "gpu_stream_producer.hpp"
+#include "gl_context_recovery.hpp"
 #include "../common/ui_mapping.hpp"
 
 #include "gl_ext_d3d12_bridge.hpp"
@@ -74,6 +75,7 @@ struct ProducerState {
     HGLRC owner_context{};
     DWORD owner_thread{};
     bool context_deleted{};
+    GlContextRecoveryRetry context_recovery;
     std::uint32_t width{ipc::kGpuStreamWidth},height{ipc::kGpuStreamHeight};
     GlExtD3D12Bridge gl_ext_bridge;
     NvDxInteropBridge nv_bridge;
@@ -803,6 +805,10 @@ void NotifyGpuStreamContextDeleted(void* context) noexcept {
     if (!g_producer || g_producer->owner_context!=context ||
         g_producer->owner_thread!=GetCurrentThreadId()) return;
     g_producer->context_deleted=true;
+    g_producer->context_recovery.Reset();
+    // Dead-context names must never be deleted in the replacement context.
+    g_producer->output_fbo=g_producer->resolve_fbo=g_producer->resolve_texture=0;
+    g_producer->resolve_width=g_producer->resolve_height=0;
     (void)LogFormat("gpu-stream-context-deleted context=%p last_ready=%llu",context,
         static_cast<unsigned long long>(g_producer->last_produced));
 }
@@ -811,29 +817,33 @@ void RecoverGpuStreamContext() noexcept {
     if (!IsGpuStreamProducerRunning() || !g_producer || !g_producer->context_deleted ||
         g_producer->owner_thread!=GetCurrentThreadId() || !wglGetCurrentContext()) return;
     auto& state=*g_producer;
-    state.context_deleted=false; // One attempt per explicit context replacement.
+    if (!state.context_recovery.BeginAttempt(GetTickCount64(),
+        OwningGlContextIsCurrent(state))) return;
     const char* missing{};
     GlExtD3D12Diagnostic diagnostic{};
-    if (state.backend!=GpuStreamInteropBackend::GlExtD3D12 ||
-        LoadGlFunctions(state.gl,missing)!=GpuStreamProducerStatus::Ok ||
-        state.gl_ext_bridge.RebindAfterContextReplacement(diagnostic)!=GlExtD3D12Status::Ok) {
-        (void)LogFormat("gpu-stream-context-recovery-failed stage=reimport detail=%s",diagnostic.detail);
+    if (!state.context_recovery.imported() &&
+        state.backend==GpuStreamInteropBackend::GlExtD3D12 &&
+        LoadGlFunctions(state.gl,missing)==GpuStreamProducerStatus::Ok &&
+        state.gl_ext_bridge.RebindAfterContextReplacement(diagnostic)==GlExtD3D12Status::Ok) {
+        state.context_recovery.MarkImported();
+        state.owner_context=wglGetCurrentContext();
+    }
+    if (!state.context_recovery.imported()) {
+        (void)LogFormat("gpu-stream-context-recovery-pending stage=reimport retry_ms=1000 detail=%s",diagnostic.detail);
         return;
     }
-    // The deleted context owned these names; deleting them in this context
-    // could destroy unrelated game objects with newly reused numeric names.
-    state.output_fbo=state.resolve_fbo=state.resolve_texture=0;
-    state.resolve_width=state.resolve_height=0;
     DrainGlErrors();
-    state.gl.gen_framebuffers(1,&state.output_fbo);
+    if (!state.output_fbo) state.gl.gen_framebuffers(1,&state.output_fbo);
     if (!state.output_fbo || glGetError()!=GL_NO_ERROR) {
-        InterlockedExchange(&g_lifecycle,static_cast<LONG>(ProducerLifecycle::Failed));
-        (void)LogFormat("gpu-stream-context-recovery-failed stage=output-fbo");
+        (void)LogFormat("gpu-stream-context-recovery-pending stage=output-fbo retry_ms=1000");
         return;
     }
-    state.owner_context=wglGetCurrentContext();
+    state.context_deleted=false;
     (void)LogFormat("gpu-stream-context-recovered context=%p last_ready=%llu",state.owner_context,
         static_cast<unsigned long long>(state.last_produced));
+}
+bool GpuStreamContextRecoveryPending() noexcept {
+    return IsGpuStreamProducerRunning() && g_producer->context_deleted;
 }
 
 void ProduceGpuStreamAfterScenePass(
@@ -1018,6 +1028,7 @@ GpuStreamProducerStatus ShutdownGpuStreamProducer() noexcept {
 }
 
 bool IsGpuStreamProducerRunning() noexcept { return false; }
+bool GpuStreamContextRecoveryPending() noexcept { return false; }
 
 } // namespace k2vr::game32
 

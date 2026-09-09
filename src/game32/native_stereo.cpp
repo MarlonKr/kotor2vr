@@ -1,4 +1,6 @@
 #include "native_stereo.hpp"
+#include "game_image_capture.hpp"
+#include "gl_context_recovery.hpp"
 #include "depth_pack.hpp"
 #include "render_trace.hpp"
 #include "scene_replay.hpp"
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -57,6 +60,8 @@ struct StereoState {
     HGLRC owner_context{};
     DWORD owner_thread{};
     bool context_deleted{},reset_history{};
+    GlContextRecoveryRetry context_recovery;
+    bool recovery_functions{};
     GlExtD3D12Bridge bridge;
     DepthPack depth_pack;
     ipc::StereoFrameMapping metadata;
@@ -144,15 +149,124 @@ std::wstring draw_trace_directory;
 unsigned draw_trace_counts[2]{};
 std::array<GLuint,32> traced_programs{};
 unsigned traced_program_count{};
-bool ego_visibility_enabled{};
-math::Vec3 ego_target{};
+bool ego_visibility_enabled{},ego_render_hook_ready{};
+const void* ego_target_object{};
+EgoMeshSelection ego_mesh_selection{};
 EngineCameraPoseWxyz ego_eye{};
-float ego_units=1.F;
-struct EgoProgram { GLuint id{}; bool skinned{}; };
-std::array<EgoProgram,64> ego_programs{};
-unsigned ego_program_count{};
-HGLRC ego_context{};
+thread_local const void* ego_drawing_object{};
+thread_local bool ego_drawing_head_attachment{};
+thread_local bool ego_primitive_hidden{};
 unsigned ego_hidden_draws{};
+const void* ego_logged_head_target{};
+unsigned ego_logged_head_mask=~0U;
+std::array<const void*,16> ego_logged_head_attachments{};
+unsigned ego_logged_head_attachment_count{};
+using GobRender=std::uint64_t(__thiscall*)(void*,bool);
+GobRender original_gob_render{};
+
+void RefreshEgoHeadPivotsSeh(void* self) noexcept {
+    ego_mesh_selection.head_pivot_mask=0;
+    __try {
+        const auto base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        const auto* vtable=*reinterpret_cast<const std::uintptr_t* const*>(self);
+        const auto address=vtable[0x98/4];
+        // Same exact getter validated by the first-person camera reader. These
+        // optional reads are isolated: a missing/faulty head cannot change eye height.
+        if (address!=base+0x00062B90U) return;
+        using GetHook=int(__thiscall*)(void*,const char*,math::Vec3*,void*);
+        const auto get_hook=reinterpret_cast<GetHook>(address);
+        const char* names[]={"Head","Eyes"};
+        const auto nan=std::numeric_limits<float>::quiet_NaN();
+        for (unsigned i=0;i<2;++i) {
+            math::Vec3 pivot{nan,nan,nan};
+            if (get_hook(self,names[i],&pivot,nullptr) && ValidFirstPersonEye(ego_mesh_selection.feet,pivot)) {
+                ego_mesh_selection.head_pivots[i]=pivot;
+                ego_mesh_selection.head_pivot_mask|=1U<<i;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ego_mesh_selection.head_pivot_mask=0;
+    }
+}
+
+bool IsEgoHeadAttachmentSeh(void* self) noexcept {
+    if (!ego_target_object || self==ego_target_object) return false;
+    __try {
+        const auto base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        std::array<EgoHeadAttachmentLink,kMaxEgoHeadAttachmentDepth> chain{};
+        const void* cursor=self;
+        for (std::size_t i=0;i<chain.size();++i) {
+            // Gob::Attach (0x461670, vtable +0x50) stores the resulting
+            // behavior through +0x58 (0x461600) at Gob+0x1B4.
+            const auto* behavior=*reinterpret_cast<unsigned char* const*>(
+                static_cast<const unsigned char*>(cursor)+0x1B4);
+            if (!behavior || *reinterpret_cast<const std::uintptr_t*>(behavior)!=
+                base+0x009918D8U-0x00400000U) return false; // exact CAurBehaviorAttach
+            // Constructor 0x504810 / base 0x504170: child +0x10,
+            // parent reference +0x14, resolved attachment node +0x18.
+            auto& link=chain[i];
+            link.child=*reinterpret_cast<void* const*>(behavior+0x10);
+            link.parent=*reinterpret_cast<void* const*>(behavior+0x14);
+            link.node=*reinterpret_cast<void* const*>(behavior+0x18);
+            link.supported=true;
+            if (link.child!=cursor || !link.parent || !link.node || link.parent==cursor) return false;
+            if (link.parent==ego_target_object) {
+                const auto* table=*reinterpret_cast<const std::uintptr_t* const*>(ego_target_object);
+                const auto address=table[0x10C/4];
+                if (address!=base+0x000587F0U) return false;
+                // This is the same node lookup used by Attach(HeadHook), not
+                // a world-position comparison. Do not cache across model changes.
+                using FindNode=void*(__thiscall*)(const void*,const char*);
+                const auto head_hook=reinterpret_cast<FindNode>(address)(ego_target_object,"HeadHook");
+                return ControlledHeadAttachment(ego_target_object,head_hook,self,
+                    std::span<const EgoHeadAttachmentLink>(chain.data(),i+1));
+            }
+            cursor=link.parent;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        // Unsupported/faulty attachments stay visible, without altering cameras.
+    }
+    return false;
+}
+
+std::uint64_t __fastcall GobRenderWrapper(void* self,void*,bool cull) noexcept {
+    // Track exact identity for synchronous mesh draws, including recursive
+    // model nodes. A nested render of another Gob gets its own identity.
+    const auto* previous=ego_drawing_object;
+    const bool previous_head=ego_drawing_head_attachment;
+    ego_drawing_object=self; ego_drawing_head_attachment=false;
+    if (ego_mesh_selection.short_model &&
+        ShouldHideFirstPersonObjectDraw(ego_visibility_enabled && ego_render_hook_ready,
+            active_eye,ego_target_object,self)) {
+        // Read after game/animation updates, immediately before this object's
+        // synchronous mesh traversal, rather than using older camera samples.
+        RefreshEgoHeadPivotsSeh(self);
+        if (ego_logged_head_target!=self || ego_logged_head_mask!=ego_mesh_selection.head_pivot_mask) {
+            char line[160]{};
+            std::snprintf(line,sizeof(line),"ego-visibility-selection target=%p mode=short-head head_pivot_mask=0x%X",
+                self,ego_mesh_selection.head_pivot_mask);
+            (void)AppendPersistentProbeLogLine(line);
+            ego_logged_head_target=self; ego_logged_head_mask=ego_mesh_selection.head_pivot_mask;
+        }
+    }
+    if (!ego_mesh_selection.short_model && ego_visibility_enabled && ego_render_hook_ready && active_eye==0) {
+        ego_drawing_head_attachment=IsEgoHeadAttachmentSeh(self);
+        if (ego_drawing_head_attachment && ego_logged_head_attachment_count<ego_logged_head_attachments.size() &&
+            std::find(ego_logged_head_attachments.begin(),
+                ego_logged_head_attachments.begin()+ego_logged_head_attachment_count,self)==
+                ego_logged_head_attachments.begin()+ego_logged_head_attachment_count) {
+            ego_logged_head_attachments[ego_logged_head_attachment_count++]=self;
+            char line[160]{};
+            std::snprintf(line,sizeof(line),"ego-visibility-head-attachment target=%p head=%p verified=HeadHook",
+                ego_target_object,self);
+            (void)AppendPersistentProbeLogLine(line);
+        }
+    }
+    std::uint64_t result{};
+    __try { result=original_gob_render(self,cull); }
+    __finally { ego_drawing_object=previous; ego_drawing_head_attachment=previous_head; }
+    return result;
+}
 using LetterboxDraw=std::uint64_t(__thiscall*)(void*,float);
 LetterboxDraw original_letterbox_draw{};
 thread_local bool letterbox_drawing{},letterbox_primitive_hidden{};
@@ -183,40 +297,27 @@ bool HideLetterboxDraw() noexcept {
 }
 
 bool BeginEgoDraw(GLsizei count) noexcept {
-    if (!ego_visibility_enabled || active_eye!=0 || !glIsEnabled(0x8620) ||
-        !IsUsableWglProcAddressValue(reinterpret_cast<std::uintptr_t>(get_arb_program)) ||
-        !IsUsableWglProcAddressValue(reinterpret_cast<std::uintptr_t>(get_arb_source))) return false;
-    const auto context=wglGetCurrentContext();
-    if (ego_context!=context) { ego_context=context; ego_program_count=0; }
-    GLint program{}; get_arb_program(0x8620,0x8677,&program);
-    if (program<=0) return false;
-    unsigned index=0;
-    for (;index<ego_program_count;++index) if (ego_programs[index].id==static_cast<GLuint>(program)) break;
-    if (index==ego_program_count) {
-        if (index>=ego_programs.size()) return false;
-        GLint length{}; get_arb_program(0x8620,0x8627,&length);
-        char source[8192]{};
-        if (length<=0 || static_cast<std::size_t>(length)>=sizeof(source)) return false;
-        get_arb_source(0x8620,0x8628,source);
-        ego_programs[index]={static_cast<GLuint>(program),std::strstr(source,"boneArray[51]") && std::strstr(source,"program.env[18..68]")};
-        ++ego_program_count;
+    if (!ego_visibility_enabled || !ego_render_hook_ready || active_eye!=0) return false;
+    if (ego_mesh_selection.short_model) {
+        // Preserve the headset-confirmed short-model Head/Eyes pivot path.
+        if (!ShouldHideFirstPersonObjectDraw(true,active_eye,ego_target_object,ego_drawing_object)) return false;
+        GLfloat mv[16]{}; glGetFloatv(GL_MODELVIEW_MATRIX,mv);
+        const auto world=math::Rotate(EngineCameraQuaternion(ego_eye),{mv[12],mv[13],mv[14]})+
+            math::Vec3{ego_eye.position_x,ego_eye.position_y,ego_eye.position_z};
+        if (!NamedEgoHeadPivot(ego_mesh_selection,world)) return false;
+    } else if (!ego_drawing_head_attachment) {
+        // Human body skins are not heads. Keep the controlled body Gob and
+        // every unrelated/hand-bound object, even when their pivots are nearby.
+        return false;
     }
-    const bool skinned=ego_programs[index].skinned;
-    if (!skinned && (count<=0 || count>768)) return false;
     GLboolean mask[4]{}; glGetBooleanv(GL_COLOR_WRITEMASK,mask);
     if (!mask[0] && !mask[1] && !mask[2]) return false; // Preserve stencil-only shadows.
-    GLfloat mv[16]{}; glGetFloatv(GL_MODELVIEW_MATRIX,mv);
-    const auto world=math::Rotate(EngineCameraQuaternion(ego_eye),{mv[12],mv[13],mv[14]})+
-        math::Vec3{ego_eye.position_x,ego_eye.position_y,ego_eye.position_z};
-    const auto relative=(world-ego_target)/ego_units;
-    // Rigid face/hair leaves precede the skinned head in the real draw stream
-    // (24..78 indices in the captured player); they have no boneArray shader.
-    // Restrict those small leaves to head height, excluding room and weapons.
-    if (!math::IsFinite(relative) || relative.x*relative.x+relative.y*relative.y>0.35F*0.35F || relative.z<0.2F || relative.z>2.2F) return false;
-    if (!skinned && relative.z<1.2F) return false;
     const bool hidden=BeginSceneReplayHiddenDraw();
     if (hidden && ego_hidden_draws++<8) {
-        char line[180]{}; std::snprintf(line,sizeof(line),"ego-visibility candidate=%s program=%d relative=%.3f,%.3f,%.3f",skinned ? "skinned-column":"rigid-head",program,relative.x,relative.y,relative.z);
+        char line[200]{};
+        std::snprintf(line,sizeof(line),"ego-visibility target=%p object=%p candidate=%s count=%d draw=%u",
+            ego_target_object,ego_drawing_object,ego_mesh_selection.short_model ? "named-head":
+                "head-attachment",count,ego_hidden_draws);
         (void)AppendPersistentProbeLogLine(line);
     }
     return hidden;
@@ -323,12 +424,14 @@ void APIENTRY StereoBegin(GLenum mode) {
         glColorMask(state->hud_gamma_mask[0],state->hud_gamma_mask[1],state->hud_gamma_mask[2],GL_FALSE);
         state->hud_gamma_alpha_saved=true;
     }
+    ego_primitive_hidden=BeginEgoDraw(0);
     letterbox_primitive_hidden=HideLetterboxDraw();
     engine_begin(mode);
 }
 void APIENTRY StereoEnd() {
     engine_end();
     if (letterbox_primitive_hidden) { glPopAttrib(); letterbox_primitive_hidden=false; }
+    if (ego_primitive_hidden) { EndSceneReplayHiddenDraw(); ego_primitive_hidden=false; }
     if (state && state->hud_gamma_alpha_saved) {
         glColorMask(state->hud_gamma_mask[0],state->hud_gamma_mask[1],state->hud_gamma_mask[2],state->hud_gamma_mask[3]);
         state->hud_gamma_alpha_saved=false;
@@ -429,6 +532,20 @@ bool InstallFramebufferRouting() noexcept {
     engine_color_mask=reinterpret_cast<ColorMask>(GetProcAddress(gl,"glColorMask"));
     engine_clear=reinterpret_cast<Clear>(GetProcAddress(gl,"glClear"));
     const auto base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    // Supported Gob vtable 0x98B5CC, Render(bool) slot +0x10. The scene's
+    // DoGobBuckets invokes it at 0x468208. Render -> 0x4B3D80 -> 0x4B11A0
+    // traverses model nodes and issues their mesh draws synchronously (RET 4).
+    original_gob_render=reinterpret_cast<GobRender>(base+0x004B3FE0U-0x00400000U);
+    const unsigned char render_prefix[]={0x55,0x8B,0xEC,0x6A,0xFF};
+    const unsigned char render_return[]={0xC2,0x04,0x00};
+    ego_render_hook_ready=std::memcmp(reinterpret_cast<const void*>(original_gob_render),
+        render_prefix,sizeof(render_prefix))==0 &&
+        std::memcmp(reinterpret_cast<const void*>(base+0x004B4666U-0x00400000U),
+            render_return,sizeof(render_return))==0 &&
+        ReplaceGamePointer(0x0098B5DCU,reinterpret_cast<void*>(original_gob_render),
+            reinterpret_cast<void*>(&GobRenderWrapper));
+    if (!ego_render_hook_ready)
+        (void)AppendPersistentProbeLogLine("ego-visibility disabled: unsupported Gob render hook");
     original_letterbox_draw=reinterpret_cast<LetterboxDraw>(base+0x008BB260U-0x00400000U);
     // Exact-build RTTI: CSWGuiDialogLetterbox vtable 0x9A7CBC, Draw(float)
     // slot +0x34. Both function prologue and RET 4 checked offline.
@@ -512,13 +629,17 @@ bool CreateStereoGlTargets() noexcept {
     glGetIntegerv(0x8CA7,&old_rb);
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     for (unsigned i=0;i<16 && glGetError()!=GL_NO_ERROR;++i) {}
-    s.gen_fbos(1,&s.eye_fbo); s.gen_fbos(1,&s.atlas_fbo);
-    glGenTextures(1,&s.eye_color); glBindTexture(GL_TEXTURE_2D,s.eye_color);
+    // Reuse partial targets on a recovery retry in this same context.
+    if (!s.eye_fbo) s.gen_fbos(1,&s.eye_fbo);
+    if (!s.atlas_fbo) s.gen_fbos(1,&s.atlas_fbo);
+    if (!s.eye_color) glGenTextures(1,&s.eye_color);
+    glBindTexture(GL_TEXTURE_2D,s.eye_color);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,static_cast<GLsizei>(s.width),
                  static_cast<GLsizei>(s.height),0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
-    glGenTextures(1,&s.eye_depth); glBindTexture(GL_TEXTURE_2D,s.eye_depth);
+    if (!s.eye_depth) glGenTextures(1,&s.eye_depth);
+    glBindTexture(GL_TEXTURE_2D,s.eye_depth);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D,0x884C,GL_NONE);
@@ -572,35 +693,56 @@ bool Initialize(const ipc::RenderRequest& request,bool request_gate_enabled,bool
 void NotifyNativeStereoContextDeleted(void* context) noexcept {
     if (!state || state->owner_context!=context || state->owner_thread!=GetCurrentThreadId()) return;
     state->context_deleted=true;
+    state->context_recovery.Reset(); state->recovery_functions=false;
     state->pair_active=state->awaiting_present=state->hud_active=false;
     state->hud_gamma_alpha_saved=false;
     active_eye=-1; projection_seen=false;
     letterbox_drawing=letterbox_primitive_hidden=false;
-    ego_context=nullptr; ego_program_count=0;
+    ego_drawing_object=nullptr; ego_target_object=nullptr;
+    ego_mesh_selection={}; ego_drawing_head_attachment=false;
+    ego_logged_head_attachment_count=0;
+    ego_logged_head_target=nullptr; ego_logged_head_mask=~0U;
+    ego_visibility_enabled=ego_primitive_hidden=false;
+    get_arb_program=nullptr; get_arb_source=nullptr; get_arb_env=nullptr;
+    // Forget dead-context names once, never on a retry in a living context.
+    auto& s=*state;
+    s.eye_fbo=s.eye_color=s.eye_depth=s.atlas_fbo=0;
+    s.mirror_fbo=s.mirror_color=0; s.mirror_width=s.mirror_height=0;
+    s.hud_fbo=s.hud_color=s.hud_depth=0; s.hud_width=s.hud_height=0;
+    s.depth_pack={}; s.swap_interval=nullptr; s.original_swap_interval=-1;
+    s.vsync_disabled=false;
     Log("native-stereo-context-deleted");
 }
 void RecoverNativeStereoContext() noexcept {
     if (!state || !state->context_deleted || state->owner_thread!=GetCurrentThreadId() ||
         !wglGetCurrentContext()) return;
     auto& s=*state;
-    s.context_deleted=false;
+    if (!s.context_recovery.BeginAttempt(GetTickCount64(),
+        s.bridge.owning_gl_context_is_current())) return;
     // Preserve the D3D ring, fence sequences and metadata mapping opened by the
     // host. Only objects owned by the deleted OpenGL context are recreated.
-    s.eye_fbo=s.eye_color=s.eye_depth=s.atlas_fbo=0;
-    s.mirror_fbo=s.mirror_color=0; s.mirror_width=s.mirror_height=0;
-    s.hud_fbo=s.hud_color=s.hud_depth=0; s.hud_width=s.hud_height=0;
-    s.depth_pack={}; s.swap_interval=nullptr; s.original_swap_interval=-1;
-    s.vsync_disabled=false;
     GlExtD3D12Diagnostic diagnostic{};
-    if (s.bridge.RebindAfterContextReplacement(diagnostic)!=GlExtD3D12Status::Ok ||
-        !LoadStereoGlFunctions() || !CreateStereoGlTargets()) {
-        s.failed=true;
+    if (!s.context_recovery.imported() &&
+        s.bridge.RebindAfterContextReplacement(diagnostic)==GlExtD3D12Status::Ok) {
+        s.context_recovery.MarkImported();
+        // Observe deletion of this replacement even if later target setup fails.
+        s.owner_context=wglGetCurrentContext();
+    }
+    if (s.context_recovery.imported() && !s.recovery_functions)
+        s.recovery_functions=LoadStereoGlFunctions();
+    if (!s.context_recovery.imported() || !s.recovery_functions || !CreateStereoGlTargets()) {
         char line[400]{}; std::snprintf(line,sizeof(line),
-            "native-stereo-context-recovery-failed detail=%s",diagnostic.detail);
+            "native-stereo-context-recovery-pending stage=%s retry_ms=1000 detail=%s",
+            !s.context_recovery.imported() ? "reimport":!s.recovery_functions ? "functions":"targets",
+            diagnostic.detail);
         Log(line); return;
     }
+    s.context_deleted=false;
     s.failed=false; s.reset_history=true; s.request_gate.Reset();
     Log("native-stereo-context-recovered eyes=2 hud=lazy histories=reset");
+}
+bool NativeStereoContextRecoveryPending() noexcept {
+    return state && state->context_deleted;
 }
 void RestoreNativeStereoPacing() noexcept {
     if (state && state->owner_thread==GetCurrentThreadId()) state->request_gate.Reset();
@@ -608,14 +750,25 @@ void RestoreNativeStereoPacing() noexcept {
         if (state->swap_interval(state->original_swap_interval)) state->vsync_disabled=false;
     }
 }
-void ConfigureNativeStereoEgoVisibility(math::Vec3 target,const EngineCameraPoseWxyz& eye,float units,bool enabled) noexcept {
-    ego_target=target; ego_eye=eye; ego_units=units;
-    ego_visibility_enabled=enabled && math::IsFinite(target) && std::isfinite(units) && units>0;
+void ConfigureNativeStereoEgoVisibility(const void* target,const EgoMeshSelection& selection,
+    const EngineCameraPoseWxyz& eye,float units,bool enabled) noexcept {
+    if (target!=ego_target_object || selection.short_model!=ego_mesh_selection.short_model) {
+        ego_hidden_draws=0; ego_logged_head_target=nullptr; ego_logged_head_mask=~0U;
+        ego_logged_head_attachment_count=0;
+    }
+    ego_target_object=target; ego_mesh_selection=selection; ego_eye=eye;
+    ego_visibility_enabled=enabled && target && math::IsFinite(selection.feet) &&
+        std::isfinite(units) && units>0;
 }
+
 bool BeginNativeStereoPair(const ipc::RenderRequest& request, std::uint64_t camera_frame,
     bool disable_monitor_vsync,const EngineCameraPoseWxyz* eyes,const void* camera,bool request_gate_enabled,
     float engine_units_per_metre,bool request_cadence) noexcept {
     if (!ipc::ValidStereoRequest(request) || !eyes || !camera) return false;
+    // Graphics settings can replace the renderer without reaching our old
+    // SwapBuffers import. The verified world-camera path is still running on
+    // the game's render thread and must be able to revive both retained rings.
+    RecoverGameImageContextsForScene();
     if (!state && !Initialize(request,request_gate_enabled,request_cadence)) {
         if (state) state->failed = true;
         Log("native-stereo-failed stage=initialization"); return false;
